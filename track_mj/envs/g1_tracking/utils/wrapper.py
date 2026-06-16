@@ -29,7 +29,11 @@ def _annotate_worldid(state: State) -> State:
     return state.replace(info=info)
 
 
-def _reset_done_envs(current_state: State, reset_fn: Callable[[jax.Array], State]) -> State:
+def _reset_done_envs(
+    current_state: State,
+    reset_fn: Callable[[jax.Array], State],
+    refresh_data_fn: Callable[[mjx.Data], mjx.Data],
+) -> State:
     split_rng = jax.vmap(lambda rng: jax.random.split(rng, 2))(current_state.info["rng"])
     reset_rng = split_rng[:, 0]
     next_rng = split_rng[:, 1]
@@ -40,6 +44,7 @@ def _reset_done_envs(current_state: State, reset_fn: Callable[[jax.Array], State
     reset_state = reset_fn(reset_rng)
     done = current_state.done.astype(bool)
     data = jax.tree_util.tree_map(lambda r, v: _where_done(done, r, v), reset_state.data, current_state.data)
+    data = refresh_data_fn(data)
     obs = jax.tree_util.tree_map(lambda r, v: _where_done(done, r, v), reset_state.obs, current_state.obs)
     info = dict(current_state.info)
     for key, reset_value in reset_state.info.items():
@@ -74,7 +79,14 @@ class VmapWrapper(Wrapper):
         reset_fn = lambda reset_rng: self.reset(reset_rng, trajectory_data)
         return jax.lax.cond(
             jp.any(state.done.astype(bool)),
-            lambda x: _reset_done_envs(x, reset_fn),
+            lambda x: _reset_done_envs(
+                x,
+                reset_fn,
+                lambda data: jax.vmap(
+                    lambda per_world_data: mjx.forward(self.env.mjx_model, per_world_data),
+                    axis_name=MJX_WORLD_AXIS_NAME,
+                )(data),
+            ),
             lambda x: x,
             state,
         )
@@ -178,7 +190,15 @@ class ModifiedDomainRandomizationVmapWrapper(Wrapper):
         reset_fn = lambda reset_rng: self.reset(reset_rng, trajectory_data)
         res = jax.lax.cond(
             jp.any(res.done.astype(bool)),
-            lambda x: _reset_done_envs(x, reset_fn),
+            lambda x: _reset_done_envs(
+                x,
+                reset_fn,
+                lambda data: jax.vmap(
+                    lambda mjx_model, per_world_data: mjx.forward(mjx_model, per_world_data),
+                    in_axes=[self._in_axes, 0],
+                    axis_name=MJX_WORLD_AXIS_NAME,
+                )(self._mjx_model_v, data),
+            ),
             lambda x: x,
             res,
         )
