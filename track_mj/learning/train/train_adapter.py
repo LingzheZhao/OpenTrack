@@ -33,6 +33,7 @@ from track_mj.dr.domain_randomize_tracking import (
     domain_randomize,
     domain_randomize_terrain,
 )
+from track_mj.utils.mjx_backend import configure_mjx
 
 
 @dataclass
@@ -336,6 +337,7 @@ def train(args: Args):
 
     _apply_policy_args_to_config(args, policy_cfg, debug_mode)
     _apply_env_args_to_config(args, env_cfg)
+    configure_mjx(env_cfg, policy_cfg.num_envs)
     if mbppo_policy_cfg is not None:
         mbppo_policy_cfg.network_factory.history_len = env_cfg.history_len
 

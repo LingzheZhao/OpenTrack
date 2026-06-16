@@ -49,6 +49,7 @@ from track_mj.dr.domain_randomize_tracking_dagger import (
     domain_randomize,
     domain_randomize_terrain,
 )
+from track_mj.utils.mjx_backend import configure_mjx
 
 
 # ========================== Args ==========================
@@ -460,6 +461,7 @@ def train(args: Args):
             privileged_obs_keys, traj_cluster_sample_probs, traj_sample_probs, traj_sample_cluster_ids = parse_dagger_config(args.dagger_config_path)
             _apply_policy_args_to_config(args, student_policy_cfg, debug_mode)
             _apply_env_args_to_config(args, student_env_cfg, privileged_obs_keys, traj_cluster_sample_probs, traj_sample_probs, traj_sample_cluster_ids)
+            configure_mjx(student_env_cfg, student_policy_cfg.num_envs)
 
             if args.task == "G1TrackingGeneralTerrainDR":
                 hfield_data = jp.asarray(np.load("storage/data/hfield/terrain.npz")["hfield_data"])

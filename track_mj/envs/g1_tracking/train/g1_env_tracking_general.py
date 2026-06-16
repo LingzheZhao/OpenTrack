@@ -12,7 +12,7 @@ import mujoco
 from mujoco import MjData, mjx
 from mujoco.mjx._src import math
 from mujoco_playground._src import mjx_env
-from mujoco_playground._src.collision import geoms_colliding
+from track_mj.utils.mjx_backend import geoms_colliding, mjx_impl
 
 import track_mj as tmj
 from track_mj.envs.g1_tracking.train import base_env as g1_base
@@ -441,9 +441,7 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         noisy_init_root_quat = math.quat_mul(yaw_noise_quat, init_traj_data.qpos[3:7])
         noisy_init_qpos = noisy_init_qpos.at[3:7].set(noisy_init_root_quat)
 
-        data = mjx_env.init(
-            self.mjx_model, qpos=noisy_init_qpos, qvel=init_traj_data.qvel, ctrl=noisy_init_qpos[7:]
-        )
+        data = self._init_mjx_data(qpos=noisy_init_qpos, qvel=init_traj_data.qvel, ctrl=noisy_init_qpos[7:])
 
         traj_no = carry.traj_state.traj_no
 
@@ -555,10 +553,11 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
             state.info["previous_obs"] = jp.concatenate([state.info["previous_obs"][1:], history[None, :]], axis=0)
 
         state = state.replace(data=data, obs=obs, reward=reward, done=done)
-        # manual reset
-        state = jax.lax.cond(
-            done, partial(self._reset_and_update_state, trajectory_data=trajectory_data), lambda x: x, state
-        )
+        # MJX-Warp reset is handled after vectorization in the training wrapper.
+        if mjx_impl(self._config) != "warp":
+            state = jax.lax.cond(
+                done, partial(self._reset_and_update_state, trajectory_data=trajectory_data), lambda x: x, state
+            )
         return state
 
     def _reset_and_update_state(self, current_state: mjx_env.State, trajectory_data: TrajectoryData) -> mjx_env.State:

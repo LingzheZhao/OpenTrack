@@ -23,6 +23,7 @@ from mujoco import mjx
 
 from mujoco_playground._src import mjx_env
 from track_mj.envs.g1_tracking import g1_tracking_constants as consts
+from track_mj.utils import mjx_backend
 
 
 class G1Env(mjx_env.MjxEnv):
@@ -42,8 +43,11 @@ class G1Env(mjx_env.MjxEnv):
         self._mj_model.vis.global_.offwidth = 3840
         self._mj_model.vis.global_.offheight = 2160
 
-        self._mjx_model = mjx.put_model(self._mj_model)
+        self._mjx_model = mjx_backend.put_model(self._mj_model, config)
         self._xml_path = xml_path
+
+    def _init_mjx_data(self, **kwargs) -> mjx.Data:
+        return mjx_backend.init_data(self._mj_model, self._mjx_model, self._config, **kwargs)
 
     # Sensor readings.
 

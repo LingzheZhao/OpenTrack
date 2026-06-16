@@ -96,6 +96,22 @@ This repository is the official implementation of OpenTrack, an open-source huma
    source .venv/bin/activate; source .env;
   ```
 
+## Optional MJX-Warp acceleration
+
+Training uses the JAX MJX backend by default. To try the NVIDIA Warp backend for MJX simulation:
+
+```shell
+uv sync
+export OPENTRACK_MJX_IMPL=warp
+
+# Defaults match the MuJoCo Warp Unitree G1 benchmark and can be raised if contacts overflow.
+export OPENTRACK_MJX_WARP_NCONMAX_PER_ENV=48
+export OPENTRACK_MJX_WARP_NJMAX=192
+```
+
+`OPENTRACK_MJX_WARP_NCONMAX_PER_ENV` is multiplied by the training `num_envs` to size MJX-Warp's
+global contact buffer. You can override the final buffer directly with `OPENTRACK_MJX_WARP_NACONMAX`.
+
 ## Play pretrained checkpoints
 
 1. Download pretrained checkpoints and configs from [checkpoints and configs](https://drive.google.com/drive/folders/1wDL4Chr6sGQiCx1tbvhf9DowN73cP_PF?usp=drive_link), and put them under `storage/logs/dagger/`. Visualization results of LAFAN1 generalist v2: [videos](https://drive.google.com/drive/folders/1wDL4Chr6sGQiCx1tbvhf9DowN73cP_PF?usp=drive_link).
@@ -231,4 +247,3 @@ If you find this repository helpful, please cite our work:
       url={https://arxiv.org/abs/2509.13833}, 
 }
 ```
-

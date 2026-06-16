@@ -12,7 +12,7 @@ import mujoco
 from mujoco import MjData, mjx
 from mujoco.mjx._src import math
 from mujoco_playground._src import mjx_env
-from mujoco_playground._src.collision import geoms_colliding
+from track_mj.utils.mjx_backend import geoms_colliding
 
 import track_mj as tmj  
 from track_mj.envs.g1_tracking_dagger.train import base_env as g1_base

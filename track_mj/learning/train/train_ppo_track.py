@@ -3,6 +3,7 @@ import functools
 import time
 import os
 import pytz
+import json
 
 from typing import Optional
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ from track_mj.dr.domain_randomize_tracking import (
     domain_randomize,
     domain_randomize_terrain,
 )
+from track_mj.utils.mjx_backend import configure_mjx
 
 @dataclass
 class Args:
@@ -46,6 +48,17 @@ class Args:
     
     # ====== policy ======
     num_timesteps: int = 2_000_000_000
+    num_envs: Optional[int] = None
+    episode_length: Optional[int] = None
+    unroll_length: Optional[int] = None
+    batch_size: Optional[int] = None
+    num_minibatches: Optional[int] = None
+    num_updates_per_batch: Optional[int] = None
+    num_evals: Optional[int] = None
+    training_metrics_steps: Optional[int] = None
+    max_devices_per_host: Optional[int] = None
+    disable_wandb: bool = False
+    save_checkpoints: bool = True
 
     obs_noise_level: float = 1.0
     history_len: int = 0
@@ -91,6 +104,24 @@ def _validate_exp_name_format(exp_name: str, debug_mode: bool):
 
 def _apply_policy_args_to_config(args: Args, cfg, debug: bool):
     cfg.num_timesteps = args.num_timesteps
+    if args.num_envs is not None:
+        cfg.num_envs = args.num_envs
+    if args.episode_length is not None:
+        cfg.episode_length = args.episode_length
+    if args.unroll_length is not None:
+        cfg.unroll_length = args.unroll_length
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
+    if args.num_minibatches is not None:
+        cfg.num_minibatches = args.num_minibatches
+    if args.num_updates_per_batch is not None:
+        cfg.num_updates_per_batch = args.num_updates_per_batch
+    if args.num_evals is not None:
+        cfg.num_evals = args.num_evals
+    if args.training_metrics_steps is not None:
+        cfg.training_metrics_steps = args.training_metrics_steps
+    if args.max_devices_per_host is not None:
+        cfg.max_devices_per_host = args.max_devices_per_host
     if debug:
         cfg.training_metrics_steps = 1000
         cfg.num_evals = 0           # NOTE: not implemented. 2: init eval & last eval
@@ -131,7 +162,7 @@ def _setup_paths(exp_name: str) -> tuple[Path, Path]:
 def _log_checkpoint_path(ckpt_path: Path):
     logging.info(f"Checkpoint path: {ckpt_path}")
 
-def _prepare_training_params(cfg, ckpt_path: Path):
+def _prepare_training_params(cfg, ckpt_path: Path, save_checkpoints: bool = True):
     params = cfg.to_dict()
     params.pop("network_factory", None)
     params["wrap_env_fn"] = wrap_fn
@@ -139,7 +170,7 @@ def _prepare_training_params(cfg, ckpt_path: Path):
     params["network_factory"] = (
         functools.partial(network_fn, **cfg.network_factory) if hasattr(cfg, "network_factory") else network_fn
     )
-    params["save_checkpoint_path"] = ckpt_path
+    params["save_checkpoint_path"] = ckpt_path if save_checkpoints else None
     return params
 
 def _init_wandb(args: Args, exp_name, env_class, task_cfg, ckpt_path, config_fname="config.json"):
@@ -163,7 +194,7 @@ def _init_wandb(args: Args, exp_name, env_class, task_cfg, ckpt_path, config_fna
     config_path.write_text(task_cfg.to_json_best_effort(indent=4))
 
 
-def _progress(num_steps, metrics, times, total_steps, debug_mode):
+def _progress(num_steps, metrics, times, total_steps, debug_mode, log_wandb):
     r"""
     Log metrcis to wandb. Estimate remaining time.
 
@@ -176,7 +207,7 @@ def _progress(num_steps, metrics, times, total_steps, debug_mode):
     """
     now = time.monotonic()
     times.append(now)
-    if metrics and not debug_mode:
+    if metrics and log_wandb:
         try:
             wandb.log(metrics, step=num_steps)
         except Exception as e:
@@ -197,6 +228,50 @@ def _report_training_time(times):
         logging.info("Done training.")
         logging.info(f"Time to JIT compile: {times[1] - times[0]:.2f}s")
         logging.info(f"Time to train: {times[-1] - times[1]:.2f}s")
+
+
+def _json_safe_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    safe = {}
+    for key, value in metrics.items():
+        try:
+            arr = np.asarray(value)
+            if arr.shape == ():
+                safe[key] = arr.item()
+            else:
+                safe[key] = arr.tolist()
+        except Exception:
+            safe[key] = str(value)
+    return safe
+
+
+def _write_training_summary(
+    logdir: Path,
+    exp_name: str,
+    task: str,
+    env_cfg,
+    policy_cfg,
+    metrics: dict[str, Any],
+    times: list[float],
+):
+    summary = {
+        "exp_name": exp_name,
+        "task": task,
+        "mjx_impl": getattr(env_cfg, "mjx", {}).get("impl", os.environ.get("OPENTRACK_MJX_IMPL", "jax")),
+        "num_timesteps": int(policy_cfg.num_timesteps),
+        "num_envs": int(policy_cfg.num_envs),
+        "episode_length": int(policy_cfg.episode_length),
+        "unroll_length": int(policy_cfg.unroll_length),
+        "batch_size": int(policy_cfg.batch_size),
+        "num_minibatches": int(policy_cfg.num_minibatches),
+        "num_updates_per_batch": int(policy_cfg.num_updates_per_batch),
+        "training_metrics": _json_safe_metrics(metrics),
+    }
+    if len(times) > 1:
+        summary["time_to_jit_compile_s"] = times[1] - times[0]
+        summary["time_to_train_s"] = times[-1] - times[1]
+    path = logdir / "training_summary.json"
+    path.write_text(json.dumps(summary, indent=2, sort_keys=True))
+    logging.info("Training summary: %s", json.dumps(summary, sort_keys=True))
 
 
 def get_trajectory_handler(env, args: Args):
@@ -235,6 +310,8 @@ def train(args: Args):
 
     _apply_policy_args_to_config(args, policy_cfg, debug_mode)
     _apply_env_args_to_config(args, env_cfg)
+    configure_mjx(env_cfg, policy_cfg.num_envs)
+    (ckpt_path / "config.json").write_text(task_cfg.to_json_best_effort(indent=4))
 
     if args.task == "G1TrackingGeneralTerrainDR":
         hfield_data = jp.asarray(np.load("storage/data/hfield/terrain.npz")["hfield_data"])
@@ -246,9 +323,9 @@ def train(args: Args):
     elif args.task == "G1TrackingGeneral":
         assert policy_cfg.randomization_fn == None
 
-    policy_params = _prepare_training_params(policy_cfg, ckpt_path)
+    policy_params = _prepare_training_params(policy_cfg, ckpt_path, save_checkpoints=args.save_checkpoints)
 
-    if not debug_mode:
+    if not debug_mode and not args.disable_wandb:
         _init_wandb(args, exp_name, env_class, task_cfg, ckpt_path)
 
     train_fn = functools.partial(ppo.train, **policy_params)
@@ -259,7 +336,7 @@ def train(args: Args):
 
     trajectory_data, obs_size, act_size = get_trajectory_handler(env, args)
 
-    make_inference_fn, params, _ = train_fn(
+    make_inference_fn, params, metrics = train_fn(
         environment=env,
         trajectory_data=trajectory_data,
         progress_fn=lambda s, m: _progress(
@@ -267,12 +344,14 @@ def train(args: Args):
             metrics=m,
             times=times,
             total_steps=policy_cfg.num_timesteps,
-            debug_mode=debug_mode
+            debug_mode=debug_mode,
+            log_wandb=not debug_mode and not args.disable_wandb,
         ),
         policy_params_fn=lambda *args: None,
     )
 
     _report_training_time(times)
+    _write_training_summary(logdir, exp_name, args.task, env_cfg, policy_cfg, metrics, times)
     inference_fn = jax.jit(make_inference_fn(params, deterministic=True))
 
     # eval_env = env_class(terrain_type=env_cfg.terrain_type, config=env_cfg)

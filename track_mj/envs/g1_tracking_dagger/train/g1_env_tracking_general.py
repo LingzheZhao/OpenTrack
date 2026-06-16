@@ -12,7 +12,7 @@ import mujoco
 from mujoco import MjData, mjx
 from mujoco.mjx._src import math
 from mujoco_playground._src import mjx_env
-from mujoco_playground._src.collision import geoms_colliding
+from track_mj.utils.mjx_backend import geoms_colliding
 
 import track_mj as tmj  
 from track_mj.envs.g1_tracking_dagger.train import base_env as g1_base
@@ -396,9 +396,7 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         noisy_init_root_quat = math.quat_mul(yaw_noise_quat, init_traj_data.qpos[3:7])
         noisy_init_qpos = noisy_init_qpos.at[3:7].set(noisy_init_root_quat)
 
-        data = mjx_env.init(
-            self.mjx_model, qpos=noisy_init_qpos, qvel=init_traj_data.qvel, ctrl=noisy_init_qpos[7:]
-        )
+        data = self._init_mjx_data(qpos=noisy_init_qpos, qvel=init_traj_data.qvel, ctrl=noisy_init_qpos[7:])
 
         traj_no = carry.traj_state.traj_no
 

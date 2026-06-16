@@ -6,6 +6,21 @@ import mujoco.mjx as mjx
 
 from brax.envs.base import Env, State, Wrapper
 from mujoco_playground._src import mjx_env, wrapper
+from track_mj.utils.mjx_backend import mjx_impl
+
+
+def _is_warp_env(env: Env) -> bool:
+    config = getattr(getattr(env, "unwrapped", env), "_config", None)
+    return mjx_impl(config) == "warp"
+
+
+def _where_done(done: jax.Array, reset_value, value):
+    if not hasattr(value, "shape"):
+        return reset_value
+    if value.shape[: done.ndim] == done.shape:
+        mask = done.reshape(done.shape + (1,) * (value.ndim - done.ndim))
+        return jp.where(mask, reset_value, value)
+    return jp.where(jp.any(done), reset_value, value)
 
 
 class VmapWrapper(Wrapper):
@@ -21,7 +36,32 @@ class VmapWrapper(Wrapper):
         return jax.vmap(self.env.reset, in_axes=(0, None))(rng, trajectory_data)
 
     def step(self, state: State, action: jax.Array, trajectory_data) -> State:
-        return jax.vmap(self.env.step, in_axes=(0, 0, None))(state, action, trajectory_data)
+        state = jax.vmap(self.env.step, in_axes=(0, 0, None))(state, action, trajectory_data)
+        if not _is_warp_env(self.env):
+            return state
+
+        def reset_done_envs(current_state: State) -> State:
+            split_rng = jax.vmap(lambda rng: jax.random.split(rng, 2))(current_state.info["rng"])
+            reset_rng = split_rng[:, 0]
+            next_rng = split_rng[:, 1]
+            current_info = dict(current_state.info)
+            current_info["rng"] = next_rng
+            current_state = current_state.replace(info=current_info)
+
+            reset_state = jax.vmap(self.env.reset, in_axes=(0, None))(reset_rng, trajectory_data)
+            done = current_state.done.astype(bool)
+            data = jax.tree_util.tree_map(lambda r, v: _where_done(done, r, v), reset_state.data, current_state.data)
+            obs = jax.tree_util.tree_map(lambda r, v: _where_done(done, r, v), reset_state.obs, current_state.obs)
+            info = dict(current_state.info)
+            for key, reset_value in reset_state.info.items():
+                info[key] = jax.tree_util.tree_map(
+                    lambda r, v: _where_done(done, r, v),
+                    reset_value,
+                    current_state.info[key],
+                )
+            return current_state.replace(data=data, obs=obs, info=info)
+
+        return jax.lax.cond(jp.any(state.done.astype(bool)), reset_done_envs, lambda x: x, state)
 
 
 class ModifiedEpisodeWrapper(Wrapper):

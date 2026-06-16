@@ -68,10 +68,36 @@ def _strip_weak_type(tree):
     # brax user code is sometimes ambiguous about weak_type.  in order to
     # avoid extra jit recompilations we strip all weak types from user input
     def f(leaf):
+        if not hasattr(leaf, "dtype"):
+            return leaf
         leaf = jnp.asarray(leaf)
         return leaf.astype(leaf.dtype)
 
     return jax.tree_util.tree_map(f, tree)
+
+
+def _warp_non_vmappable_pmap_axes(tree):
+    """Builds pmap axes for MJX-Warp Data leaves that do not vmap."""
+    try:
+        from mujoco.mjx.warp import types as mjxw_types  # pytype: disable=import-error
+    except Exception:
+        return 0
+
+    def axis_for_path(path, _):
+        names = [p.name for p in path if isinstance(p, jax.tree_util.GetAttrKey)]
+        if "_impl" in names:
+            impl_start = names.index("_impl") + 1
+            attr = "__".join(names[impl_start:])
+            if attr in mjxw_types.DATA_NON_VMAP:
+                return None
+        return 0
+
+    return jax.tree_util.tree_map_with_path(axis_for_path, tree)
+
+
+def _mjx_impl_name(model: Any) -> str:
+    impl = getattr(model, "impl", "")
+    return str(getattr(impl, "value", impl))
 
 
 def _maybe_wrap_env(
@@ -450,7 +476,13 @@ def train(
         loss_metrics = jax.tree_util.tree_map(jnp.mean, loss_metrics)
         return training_state, state, loss_metrics
 
-    training_epoch = jax.pmap(training_epoch, axis_name=_PMAP_AXIS_NAME)
+    env_state_pmap_axes = _warp_non_vmappable_pmap_axes(env_state) if _mjx_impl_name(environment.mjx_model) == "warp" else 0
+    training_epoch = jax.pmap(
+        training_epoch,
+        axis_name=_PMAP_AXIS_NAME,
+        in_axes=(0, env_state_pmap_axes, 0),
+        out_axes=(0, env_state_pmap_axes, 0),
+    )
 
     # Note that this is NOT a pure jittable method.
     def training_epoch_with_timing(
