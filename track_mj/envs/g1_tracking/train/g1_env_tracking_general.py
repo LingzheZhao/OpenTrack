@@ -872,7 +872,10 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         dif_joint_pos = traj_data.qpos[7:] - joint_pos
         dif_joint_vel = traj_data.qvel[6:] - joint_vel
 
-        feet_contact = jp.array([geoms_colliding(data, geom_id, self._floor_geom_id) for geom_id in self._feet_geom_id])
+        worldid = info.get("worldid")
+        feet_contact = jp.array(
+            [geoms_colliding(data, geom_id, self._floor_geom_id, worldid=worldid) for geom_id in self._feet_geom_id]
+        )
 
         traj_root_rot_mat = math.quat_to_mat(traj_data.qpos[3:7])
         root_rot_mat = math.quat_to_mat(data.qpos[3:7])
@@ -1020,7 +1023,7 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
             "penalty_action_rate": self._reward_penalty_action_rate(motor_targets, info["last_motor_targets"]),
             "dof_pos_limit": self._reward_dof_pos_limit(data.qpos[7:]),
             "dof_vel_limit": self._reward_dof_vel_limit(data.qvel[6:]),
-            "collision": self._reward_collision(data),
+            "collision": self._reward_collision(data, info.get("worldid")),
             "termination": self._reward_termination(termination),
             "feet_height_tracking": self._reward_feet_height_tracking(dif_feet_height),
             "root_height_tracking": self._reward_root_height_tracking(dif_root_height),
@@ -1131,11 +1134,11 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
 
         return penalty
 
-    def _reward_collision(self, data: mjx.Data) -> jax.Array:
+    def _reward_collision(self, data: mjx.Data, worldid: jax.Array | None = None) -> jax.Array:
         pair_geom1 = self.penalize_collision_pair[:, 0]
         pair_geom2 = self.penalize_collision_pair[:, 1]
 
-        collided_values = jax.vmap(partial(geoms_colliding, data))(pair_geom1, pair_geom2)
+        collided_values = jax.vmap(partial(geoms_colliding, data, worldid=worldid))(pair_geom1, pair_geom2)
 
         return jp.sum(collided_values, axis=-1)
 

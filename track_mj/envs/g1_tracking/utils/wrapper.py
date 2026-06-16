@@ -6,7 +6,7 @@ import mujoco.mjx as mjx
 
 from brax.envs.base import Env, State, Wrapper
 from mujoco_playground._src import mjx_env, wrapper
-from track_mj.utils.mjx_backend import mjx_impl
+from track_mj.utils.mjx_backend import MJX_WORLD_AXIS_NAME, mjx_impl
 
 
 def _is_warp_env(env: Env) -> bool:
@@ -23,6 +23,34 @@ def _where_done(done: jax.Array, reset_value, value):
     return jp.where(jp.any(done), reset_value, value)
 
 
+def _annotate_worldid(state: State) -> State:
+    info = dict(state.info)
+    info["worldid"] = jp.arange(state.done.shape[0], dtype=jp.int32)
+    return state.replace(info=info)
+
+
+def _reset_done_envs(current_state: State, reset_fn: Callable[[jax.Array], State]) -> State:
+    split_rng = jax.vmap(lambda rng: jax.random.split(rng, 2))(current_state.info["rng"])
+    reset_rng = split_rng[:, 0]
+    next_rng = split_rng[:, 1]
+    current_info = dict(current_state.info)
+    current_info["rng"] = next_rng
+    current_state = current_state.replace(info=current_info)
+
+    reset_state = reset_fn(reset_rng)
+    done = current_state.done.astype(bool)
+    data = jax.tree_util.tree_map(lambda r, v: _where_done(done, r, v), reset_state.data, current_state.data)
+    obs = jax.tree_util.tree_map(lambda r, v: _where_done(done, r, v), reset_state.obs, current_state.obs)
+    info = dict(current_state.info)
+    for key, reset_value in reset_state.info.items():
+        info[key] = jax.tree_util.tree_map(
+            lambda r, v: _where_done(done, r, v),
+            reset_value,
+            current_state.info[key],
+        )
+    return current_state.replace(data=data, obs=obs, info=info)
+
+
 class VmapWrapper(Wrapper):
     """Vectorizes Brax env."""
 
@@ -33,35 +61,23 @@ class VmapWrapper(Wrapper):
     def reset(self, rng: jax.Array, trajectory_data) -> State:
         if self.batch_size is not None:
             rng = jax.random.split(rng, self.batch_size)
-        return jax.vmap(self.env.reset, in_axes=(0, None))(rng, trajectory_data)
+        state = jax.vmap(self.env.reset, in_axes=(0, None), axis_name=MJX_WORLD_AXIS_NAME)(rng, trajectory_data)
+        return _annotate_worldid(state)
 
     def step(self, state: State, action: jax.Array, trajectory_data) -> State:
-        state = jax.vmap(self.env.step, in_axes=(0, 0, None))(state, action, trajectory_data)
+        state = jax.vmap(self.env.step, in_axes=(0, 0, None), axis_name=MJX_WORLD_AXIS_NAME)(
+            state, action, trajectory_data
+        )
         if not _is_warp_env(self.env):
             return state
 
-        def reset_done_envs(current_state: State) -> State:
-            split_rng = jax.vmap(lambda rng: jax.random.split(rng, 2))(current_state.info["rng"])
-            reset_rng = split_rng[:, 0]
-            next_rng = split_rng[:, 1]
-            current_info = dict(current_state.info)
-            current_info["rng"] = next_rng
-            current_state = current_state.replace(info=current_info)
-
-            reset_state = jax.vmap(self.env.reset, in_axes=(0, None))(reset_rng, trajectory_data)
-            done = current_state.done.astype(bool)
-            data = jax.tree_util.tree_map(lambda r, v: _where_done(done, r, v), reset_state.data, current_state.data)
-            obs = jax.tree_util.tree_map(lambda r, v: _where_done(done, r, v), reset_state.obs, current_state.obs)
-            info = dict(current_state.info)
-            for key, reset_value in reset_state.info.items():
-                info[key] = jax.tree_util.tree_map(
-                    lambda r, v: _where_done(done, r, v),
-                    reset_value,
-                    current_state.info[key],
-                )
-            return current_state.replace(data=data, obs=obs, info=info)
-
-        return jax.lax.cond(jp.any(state.done.astype(bool)), reset_done_envs, lambda x: x, state)
+        reset_fn = lambda reset_rng: self.reset(reset_rng, trajectory_data)
+        return jax.lax.cond(
+            jp.any(state.done.astype(bool)),
+            lambda x: _reset_done_envs(x, reset_fn),
+            lambda x: x,
+            state,
+        )
 
 
 class ModifiedEpisodeWrapper(Wrapper):
@@ -143,15 +159,29 @@ class ModifiedDomainRandomizationVmapWrapper(Wrapper):
             env = self._env_fn(mjx_model=mjx_model)
             return env.reset(rng, trajectory_data)
 
-        state = jax.vmap(reset, in_axes=[self._in_axes, 0, None])(self._mjx_model_v, rng, trajectory_data)
-        return state
+        state = jax.vmap(reset, in_axes=[self._in_axes, 0, None], axis_name=MJX_WORLD_AXIS_NAME)(
+            self._mjx_model_v, rng, trajectory_data
+        )
+        return _annotate_worldid(state)
 
     def step(self, state: mjx_env.State, action: jax.Array, trajectory_data) -> mjx_env.State:
         def step(mjx_model, s, a, trajectory_data):
             env = self._env_fn(mjx_model=mjx_model)
             return env.step(s, a, trajectory_data)
 
-        res = jax.vmap(step, in_axes=[self._in_axes, 0, 0, None])(self._mjx_model_v, state, action, trajectory_data)
+        res = jax.vmap(step, in_axes=[self._in_axes, 0, 0, None], axis_name=MJX_WORLD_AXIS_NAME)(
+            self._mjx_model_v, state, action, trajectory_data
+        )
+        if not _is_warp_env(self.env):
+            return res
+
+        reset_fn = lambda reset_rng: self.reset(reset_rng, trajectory_data)
+        res = jax.lax.cond(
+            jp.any(res.done.astype(bool)),
+            lambda x: _reset_done_envs(x, reset_fn),
+            lambda x: x,
+            res,
+        )
         return res
 
 

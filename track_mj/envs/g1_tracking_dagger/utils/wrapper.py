@@ -6,6 +6,13 @@ import mujoco.mjx as mjx
 
 from brax.envs.base import Env, State, Wrapper
 from mujoco_playground._src import mjx_env, wrapper
+from track_mj.utils.mjx_backend import MJX_WORLD_AXIS_NAME
+
+
+def _annotate_worldid(state: State) -> State:
+    info = dict(state.info)
+    info["worldid"] = jp.arange(state.done.shape[0], dtype=jp.int32)
+    return state.replace(info=info)
 
 
 class VmapWrapper(Wrapper):
@@ -21,10 +28,11 @@ class VmapWrapper(Wrapper):
     def reset(self, rng: jax.Array, trajectory_data) -> State:
         if self.batch_size is not None:
             rng = jax.random.split(rng, self.batch_size)
-        return jax.vmap(self.env.reset, in_axes=(0, None))(rng, trajectory_data)
+        state = jax.vmap(self.env.reset, in_axes=(0, None), axis_name=MJX_WORLD_AXIS_NAME)(rng, trajectory_data)
+        return _annotate_worldid(state)
 
     def step(self, state: State, action: jax.Array, trajectory_data) -> State:
-        return jax.vmap(self.env.step, in_axes=(0, 0, None))(
+        return jax.vmap(self.env.step, in_axes=(0, 0, None), axis_name=MJX_WORLD_AXIS_NAME)(
             state, action, trajectory_data
         )
 
@@ -144,10 +152,10 @@ class ModifiedDomainRandomizationVmapWrapper(Wrapper):
             env = self._env_fn(mjx_model=mjx_model)
             return env.reset(rng, trajectory_data)
 
-        state = jax.vmap(reset, in_axes=[self._in_axes, 0, None])(
+        state = jax.vmap(reset, in_axes=[self._in_axes, 0, None], axis_name=MJX_WORLD_AXIS_NAME)(
             self._mjx_model_v, rng, trajectory_data
         )
-        return state
+        return _annotate_worldid(state)
 
     def step(
         self, state: mjx_env.State, action: jax.Array, trajectory_data
@@ -156,7 +164,7 @@ class ModifiedDomainRandomizationVmapWrapper(Wrapper):
             env = self._env_fn(mjx_model=mjx_model)
             return env.step(s, a, trajectory_data)
 
-        res = jax.vmap(step, in_axes=[self._in_axes, 0, 0, None])(
+        res = jax.vmap(step, in_axes=[self._in_axes, 0, 0, None], axis_name=MJX_WORLD_AXIS_NAME)(
             self._mjx_model_v, state, action, trajectory_data
         )
         return res

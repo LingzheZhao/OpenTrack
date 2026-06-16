@@ -25,6 +25,7 @@ WARP_NJMAX_ENV = "OPENTRACK_MJX_WARP_NJMAX"
 DEFAULT_IMPL = "jax"
 DEFAULT_WARP_NCONMAX_PER_ENV = 48
 DEFAULT_WARP_NJMAX = 192
+MJX_WORLD_AXIS_NAME = "opentrack_mjx_world"
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,8 @@ class ContactView:
     geom: jax.Array
     dist: jax.Array
     frame: jax.Array
+    worldid: Optional[jax.Array] = None
+    nacon: Optional[jax.Array] = None
 
 
 def _env_int(name: str, default: Optional[int]) -> Optional[int]:
@@ -199,6 +202,8 @@ def contact_view(data: mjx.Data) -> ContactView:
             geom=impl_data.contact__geom,
             dist=impl_data.contact__dist,
             frame=impl_data.contact__frame,
+            worldid=impl_data.contact__worldid,
+            nacon=impl_data.nacon,
         )
     if impl_data is not None and hasattr(impl_data, "contact"):
         contact = impl_data.contact
@@ -207,15 +212,44 @@ def contact_view(data: mjx.Data) -> ContactView:
     return ContactView(geom=contact.geom, dist=contact.dist, frame=contact.frame)
 
 
-def get_collision_info(data: mjx.Data, geom1: int, geom2: int) -> tuple[jax.Array, jax.Array]:
+def _current_worldid() -> jax.Array:
+    try:
+        return jax.lax.axis_index(MJX_WORLD_AXIS_NAME)
+    except NameError:
+        return jp.array(0, dtype=jp.int32)
+
+
+def _contact_active_mask(contact: ContactView, worldid: Optional[jax.Array]) -> jax.Array:
+    active = jp.ones(contact.dist.shape, dtype=bool)
+    if contact.nacon is not None:
+        active &= jp.arange(contact.dist.shape[0]) < jp.asarray(contact.nacon)[0]
+    if contact.worldid is not None:
+        if worldid is None:
+            worldid = _current_worldid()
+        active &= contact.worldid == jp.asarray(worldid, dtype=contact.worldid.dtype)
+    return active
+
+
+def get_collision_info(
+    data: mjx.Data,
+    geom1: int,
+    geom2: int,
+    worldid: Optional[jax.Array] = None,
+) -> tuple[jax.Array, jax.Array]:
     contact = contact_view(data)
     mask = (jp.array([geom1, geom2]) == contact.geom).all(axis=1)
     mask |= (jp.array([geom2, geom1]) == contact.geom).all(axis=1)
+    mask &= _contact_active_mask(contact, worldid)
     idx = jp.where(mask, contact.dist, 1e4).argmin()
     dist = contact.dist[idx] * mask[idx]
     normal = (dist < 0) * contact.frame[idx, 0, :3]
     return dist, normal
 
 
-def geoms_colliding(data: mjx.Data, geom1: int, geom2: int) -> jax.Array:
-    return get_collision_info(data, geom1, geom2)[0] < 0
+def geoms_colliding(
+    data: mjx.Data,
+    geom1: int,
+    geom2: int,
+    worldid: Optional[jax.Array] = None,
+) -> jax.Array:
+    return get_collision_info(data, geom1, geom2, worldid=worldid)[0] < 0
