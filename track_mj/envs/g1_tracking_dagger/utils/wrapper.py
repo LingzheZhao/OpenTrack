@@ -6,13 +6,54 @@ import mujoco.mjx as mjx
 
 from brax.envs.base import Env, State, Wrapper
 from mujoco_playground._src import mjx_env, wrapper
-from track_mj.utils.mjx_backend import MJX_WORLD_AXIS_NAME
+from track_mj.utils.mjx_backend import MJX_WORLD_AXIS_NAME, mjx_impl
+
+
+def _is_warp_env(env: Env) -> bool:
+    config = getattr(getattr(env, "unwrapped", env), "_config", None)
+    return mjx_impl(config) == "warp"
+
+
+def _where_done(done: jax.Array, reset_value, value):
+    if not hasattr(value, "shape"):
+        return reset_value
+    if value.shape[: done.ndim] == done.shape:
+        mask = done.reshape(done.shape + (1,) * (value.ndim - done.ndim))
+        return jp.where(mask, reset_value, value)
+    return jp.where(jp.any(done), reset_value, value)
 
 
 def _annotate_worldid(state: State) -> State:
     info = dict(state.info)
     info["worldid"] = jp.arange(state.done.shape[0], dtype=jp.int32)
     return state.replace(info=info)
+
+
+def _reset_done_envs(
+    current_state: State,
+    reset_fn: Callable[[jax.Array], State],
+    refresh_data_fn: Callable[[mjx.Data], mjx.Data],
+) -> State:
+    split_rng = jax.vmap(lambda rng: jax.random.split(rng, 2))(current_state.info["rng"])
+    reset_rng = split_rng[:, 0]
+    next_rng = split_rng[:, 1]
+    current_info = dict(current_state.info)
+    current_info["rng"] = next_rng
+    current_state = current_state.replace(info=current_info)
+
+    reset_state = reset_fn(reset_rng)
+    done = current_state.done.astype(bool)
+    data = jax.tree_util.tree_map(lambda r, v: _where_done(done, r, v), reset_state.data, current_state.data)
+    data = refresh_data_fn(data)
+    obs = jax.tree_util.tree_map(lambda r, v: _where_done(done, r, v), reset_state.obs, current_state.obs)
+    info = dict(current_state.info)
+    for key, reset_value in reset_state.info.items():
+        info[key] = jax.tree_util.tree_map(
+            lambda r, v: _where_done(done, r, v),
+            reset_value,
+            current_state.info[key],
+        )
+    return current_state.replace(data=data, obs=obs, info=info)
 
 
 class VmapWrapper(Wrapper):
@@ -32,8 +73,25 @@ class VmapWrapper(Wrapper):
         return _annotate_worldid(state)
 
     def step(self, state: State, action: jax.Array, trajectory_data) -> State:
-        return jax.vmap(self.env.step, in_axes=(0, 0, None), axis_name=MJX_WORLD_AXIS_NAME)(
+        state = jax.vmap(self.env.step, in_axes=(0, 0, None), axis_name=MJX_WORLD_AXIS_NAME)(
             state, action, trajectory_data
+        )
+        if not _is_warp_env(self.env):
+            return state
+
+        reset_fn = lambda reset_rng: self.reset(reset_rng, trajectory_data)
+        return jax.lax.cond(
+            jp.any(state.done.astype(bool)),
+            lambda x: _reset_done_envs(
+                x,
+                reset_fn,
+                lambda data: jax.vmap(
+                    lambda per_world_data: mjx.forward(self.env.mjx_model, per_world_data),
+                    axis_name=MJX_WORLD_AXIS_NAME,
+                )(data),
+            ),
+            lambda x: x,
+            state,
         )
 
     def _get_motor_targets(self, state: State, action: jax.Array, use_residual_action: bool, trajectory_data) -> jax.Array:
@@ -166,6 +224,24 @@ class ModifiedDomainRandomizationVmapWrapper(Wrapper):
 
         res = jax.vmap(step, in_axes=[self._in_axes, 0, 0, None], axis_name=MJX_WORLD_AXIS_NAME)(
             self._mjx_model_v, state, action, trajectory_data
+        )
+        if not _is_warp_env(self.env):
+            return res
+
+        reset_fn = lambda reset_rng: self.reset(reset_rng, trajectory_data)
+        res = jax.lax.cond(
+            jp.any(res.done.astype(bool)),
+            lambda x: _reset_done_envs(
+                x,
+                reset_fn,
+                lambda data: jax.vmap(
+                    lambda mjx_model, per_world_data: mjx.forward(mjx_model, per_world_data),
+                    in_axes=[self._in_axes, 0],
+                    axis_name=MJX_WORLD_AXIS_NAME,
+                )(self._mjx_model_v, data),
+            ),
+            lambda x: x,
+            res,
         )
         return res
 

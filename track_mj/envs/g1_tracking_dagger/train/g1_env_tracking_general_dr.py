@@ -12,7 +12,7 @@ import mujoco
 from mujoco import MjData, mjx
 from mujoco.mjx._src import math
 from mujoco_playground._src import mjx_env
-from track_mj.utils.mjx_backend import geoms_colliding
+from track_mj.utils.mjx_backend import geoms_colliding, mjx_impl
 
 import track_mj as tmj  
 from track_mj.envs.g1_tracking_dagger.train import base_env as g1_base
@@ -413,6 +413,11 @@ class G1TrackingGeneralDREnv(g1_env_tracking_general.G1TrackingGeneralEnv):
             state.info["previous_obs"] = jp.concatenate([state.info["previous_obs"][1:], history[None, :]], axis=0)
 
         state = state.replace(data=data, obs=obs, reward=reward, done=done)
+        # Warp cannot call mjx.forward from this per-env reset branch once vmapped;
+        # the DAgger wrapper resets done worlds after the vmap instead.
+        if mjx_impl(self._config) == "warp" and "worldid" in state.info:
+            return state
+
         # manual reset
         state = jax.lax.cond(
             done, partial(self._reset_and_update_state, trajectory_data=trajectory_data), lambda x: x, state
