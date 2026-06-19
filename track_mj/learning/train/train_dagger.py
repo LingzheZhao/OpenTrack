@@ -142,7 +142,7 @@ def _parse_exp_tags(tags):
     return [str(tags)]
 
 
-def parse_dagger_config(dagger_config_path: str) -> Tuple[List[str], np.ndarray, Dict[str, np.ndarray], Dict[str, int]]:
+def parse_dagger_config(dagger_config_path: str) -> Tuple[List[str], np.ndarray, Dict[str, np.ndarray], Dict[str, int], Dict[str, Optional[str]]]:
     r"""
     Returns:
         privileged_obs_keys: List[str], the privileged observation keys used by teacher policies.
@@ -164,14 +164,16 @@ def parse_dagger_config(dagger_config_path: str) -> Tuple[List[str], np.ndarray,
     traj_cluster_sample_probs = []
     traj_sample_probs = []
     traj_sample_cluster_ids = []
-
-    ref_motion_root = os.path.join(os.getcwd(), "storage", "data", "mocap", "lafan1", "UnitreeG1")
+    traj_dataset = {}   # motion -> its cluster's source dataset ("lafan1"/"amass"/...); None when the cluster omits it
 
     for cluster_id, cluster in enumerate(motion_clusters):
         _cluster_id = cluster["cluster_id"]
         _teacher_ckpt_dir = os.path.join(os.getcwd(), cluster["teacher_ckpt_dir"])
         _motions = cluster["motions"]
         _cluster_sample_prob = cluster["prob"]
+        # optional per-cluster source dataset; reference npz live under mocap/<dataset>/UnitreeG1 (legacy: lafan1)
+        _dataset = cluster.get("dataset")
+        ref_motion_root = os.path.join(os.getcwd(), "storage", "data", "mocap", _dataset or "lafan1", "UnitreeG1")
 
         try:
             with open(os.path.join(_teacher_ckpt_dir, "checkpoints", "config.json"), 'r') as f:
@@ -189,6 +191,7 @@ def parse_dagger_config(dagger_config_path: str) -> Tuple[List[str], np.ndarray,
                 if not os.path.exists(os.path.join(ref_motion_root, _m + ".npz")):
                     raise FileNotFoundError(f"Reference motion {_m} does not exist.")
                 traj_sample_cluster_ids.append(cluster_id)
+                traj_dataset[_m] = _dataset
             if set(_motions).intersection(set(all_trajs)):
                 raise ValueError(f"Motion names in cluster id {_cluster_id} overlap with previous clusters.")
             all_trajs.extend(_motions)
@@ -214,7 +217,7 @@ def parse_dagger_config(dagger_config_path: str) -> Tuple[List[str], np.ndarray,
     traj_sample_probs = {k: v for k, v in zip(all_trajs, traj_sample_probs)}
     traj_sample_cluster_ids = {k: v for k, v in zip(all_trajs, traj_sample_cluster_ids)}
 
-    return last_cluster_teacher_obs, traj_cluster_sample_probs, traj_sample_probs, traj_sample_cluster_ids
+    return last_cluster_teacher_obs, traj_cluster_sample_probs, traj_sample_probs, traj_sample_cluster_ids, traj_dataset
 
 def _apply_policy_args_to_config(args: Args, policy_cfg: config_dict.ConfigDict, debug: bool):
 
@@ -242,7 +245,8 @@ def _apply_policy_args_to_config(args: Args, policy_cfg: config_dict.ConfigDict,
 
 def _apply_env_args_to_config(
         args: Args, env_cfg: config_dict.ConfigDict,
-        privileged_obs_keys: List[str], traj_cluster_sample_probs: np.ndarray, traj_sample_probs: Dict[str, np.ndarray], traj_sample_cluster_ids: Dict[str, int]
+        privileged_obs_keys: List[str], traj_cluster_sample_probs: np.ndarray, traj_sample_probs: Dict[str, np.ndarray], traj_sample_cluster_ids: Dict[str, int],
+        traj_dataset: Dict[str, Optional[str]] = None
     ):
 
     # read priv obs from teacher config
@@ -258,11 +262,18 @@ def _apply_env_args_to_config(
     # Ensure the actual loaded reference trajectories follow the DAgger config
     all_dagger_trajs = list(traj_sample_probs.keys())
     assert len(all_dagger_trajs) > 0, "No trajectories found after parsing DAgger config."
-    if env_cfg.reference_traj_config.name is None or len(env_cfg.reference_traj_config.name) == 0:
-        env_cfg.reference_traj_config.name = {"lafan1": all_dagger_trajs}
+    traj_dataset = traj_dataset or {}
+    if all(traj_dataset.get(_m) for _m in all_dagger_trajs):
+        # every cluster declared its source dataset -> group so each loads from mocap/<dataset>/ + logs separately
+        grouped: Dict[str, List[str]] = {}
+        for _m in all_dagger_trajs:
+            grouped.setdefault(traj_dataset[_m], []).append(_m)
+        env_cfg.reference_traj_config.name = grouped
+    elif env_cfg.reference_traj_config.name is None or len(env_cfg.reference_traj_config.name) == 0:
+        env_cfg.reference_traj_config.name = {"lafan1": all_dagger_trajs}   # legacy: single default key
     else:
         dataset_name = next(iter(env_cfg.reference_traj_config.name.keys()))
-        env_cfg.reference_traj_config.name = {dataset_name: all_dagger_trajs}
+        env_cfg.reference_traj_config.name = {dataset_name: all_dagger_trajs}   # legacy: single pre-set key
 
     cluster_counts: Dict[int, int] = {}
     for _, cluster_id in traj_sample_cluster_ids.items():
@@ -458,9 +469,9 @@ def train(args: Args):
     with jax.default_device(device_jax):
         with jax.disable_jit():
 
-            privileged_obs_keys, traj_cluster_sample_probs, traj_sample_probs, traj_sample_cluster_ids = parse_dagger_config(args.dagger_config_path)
+            privileged_obs_keys, traj_cluster_sample_probs, traj_sample_probs, traj_sample_cluster_ids, traj_dataset = parse_dagger_config(args.dagger_config_path)
             _apply_policy_args_to_config(args, student_policy_cfg, debug_mode)
-            _apply_env_args_to_config(args, student_env_cfg, privileged_obs_keys, traj_cluster_sample_probs, traj_sample_probs, traj_sample_cluster_ids)
+            _apply_env_args_to_config(args, student_env_cfg, privileged_obs_keys, traj_cluster_sample_probs, traj_sample_probs, traj_sample_cluster_ids, traj_dataset)
             configure_mjx(student_env_cfg, student_policy_cfg.num_envs)
 
             if args.task == "G1TrackingGeneralTerrainDR":
