@@ -1122,46 +1122,69 @@ def calculate_joint_velocity(qpos: jax.Array, frequency: float, backend: ModuleT
 
     return joint_vel
 
-def recalculate_traj_angular_velocity(traj: Trajectory, frequency: float, backend: ModuleType = jnp):
+def _quat_mul(q1, q2, backend):
+    """Hamilton product of WXYZ quaternions. Both inputs [N,4] WXYZ; returns [N,4] WXYZ."""
+    w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
+    w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
+    return backend.stack([w1*w2 - x1*x2 - y1*y2 - z1*z2, w1*x2 + x1*w2 + y1*z2 - z1*y2,
+                          w1*y2 - x1*z2 + y1*w2 + z1*x2, w1*z2 + x1*y2 - y1*x2 + z1*w2], axis=1)
+
+def _mhm_backward(vals, frequency, velocity_max_horizon, backend):
+    """Backward-aligned multi-horizon-min velocity for qvel[1:] (frame 0 kept as loaded).
+    vals:[T,D] -> [T-1,D]. Per target frame picks the horizon (1..H) with minimum |velocity|,
+    rejecting single-frame mocap-noise spikes. velocity_max_horizon=1 reduces to plain backward diff."""
+    T = vals.shape[0]; D = vals.shape[1]; C = []; M = []
+    H = min(velocity_max_horizon, max(1, T - 1))    # clamp so every horizon has >=1 valid frame (short clips)
+    for h in range(1, H + 1):
+        d = (vals[h:] - vals[:-h]) * (frequency / h); pad = h - 1
+        C.append(backend.concatenate([backend.zeros((pad, D)), d], axis=0))
+        M.append(backend.concatenate([backend.full((pad,), float('inf')), backend.linalg.norm(d, axis=1)], axis=0))
+    C = backend.stack(C, axis=0); M = backend.stack(M, axis=0)
+    idx = backend.argmin(M, axis=0)
+    return backend.take_along_axis(C, idx[None, :, None], axis=0)[0]
+
+def _mhm_angular(quat_wxyz, frequency, velocity_max_horizon, backend):
+    """Backward-aligned multi-horizon-min LOCAL-frame angular velocity for qvel[1:, 3:6].
+    quat_wxyz:[T,4] WXYZ (MuJoCo qpos free-joint quat) -> [T-1,3]. velocity_max_horizon=1 reduces to the
+    original single-horizon quaternion-difference recalc."""
+    qc = backend.concatenate([quat_wxyz[:, :1], -quat_wxyz[:, 1:]], axis=1)   # WXYZ conjugate
+    C = []; M = []
+    H = min(velocity_max_horizon, max(1, quat_wxyz.shape[0] - 1))             # clamp for short clips
+    for h in range(1, H + 1):
+        dq = _quat_mul(qc[:-h], quat_wxyz[h:], backend)                        # WXYZ local delta (t-h -> t)
+        s = 2 * dq[:, 0] ** 2 - 1
+        angle = backend.arccos(backend.clip(s, -1, 1))
+        axis = dq[:, 1:] / backend.linalg.norm(dq[:, 1:], axis=1, keepdims=True).clip(min=1e-9)
+        av = axis * (angle * frequency / h)[:, None]; pad = h - 1
+        C.append(backend.concatenate([backend.zeros((pad, 3)), av], axis=0))
+        M.append(backend.concatenate([backend.full((pad,), float('inf')), backend.abs(angle * frequency / h)], axis=0))
+    C = backend.stack(C, axis=0); M = backend.stack(M, axis=0)
+    idx = backend.argmin(M, axis=0)
+    return backend.take_along_axis(C, idx[None, :, None], axis=0)[0]
+
+def recalculate_traj_angular_velocity(traj: Trajectory, frequency: float, backend: ModuleType = jnp,
+                                      velocity_max_horizon: int = 3):
     """
     Recalculate the angular velocity of the trajectory.
-    qvel: free joint 3 linear (global) + 3 angular (local), hinge joint 1xn
+    qvel: free joint 3 linear (global) + 3 angular (local, WXYZ quat-delta), hinge joint 1xn.
+    velocity_max_horizon>1 applies multi-horizon-min noise filtering (default on); =1 is the original recalc.
     """
-    def quat_mul_angle_axis(q1, q2):
-        w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
-        w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
-        w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
-        x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
-        y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
-        z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
-        
-        s = 2 * (w ** 2) - 1
-        angle = backend.arccos(backend.clip(s, -1, 1))
-        axis = backend.stack([x, y, z], axis=1)
-        axis /= backend.linalg.norm(axis, axis=-1, keepdims=True).clip(min=1e-9)
-        return angle, axis
-    
-    print(traj.data.qpos.shape, traj.data.qvel.shape, traj.data.xpos.shape, traj.data.xquat.shape)
-
-    freejoint_quat = traj.data.qpos[:, 3:7]
-    freejoint_quat_inv = backend.concatenate([freejoint_quat[:, :1], -freejoint_quat[:, 1:]], axis=1)
-    angle, axis = quat_mul_angle_axis(freejoint_quat_inv[:-1], freejoint_quat[1:])
-    freejoint_angvel = axis * angle[..., backend.newaxis] * frequency
+    freejoint_quat = traj.data.qpos[:, 3:7]                                     # WXYZ (MuJoCo qpos)
+    freejoint_angvel = _mhm_angular(freejoint_quat, frequency, velocity_max_horizon, backend)  # local frame
     if backend == jnp:
         qvel = traj.data.qvel.at[1:, 3:6].set(freejoint_angvel)
         traj = replace(traj, data=replace(traj.data, qvel=qvel))
     else:
-        print(traj.data.qvel.shape, freejoint_angvel.shape)
         traj.data.qvel[1:, 3:6] = freejoint_angvel
-        
     return traj
 
-def recalculate_traj_linear_velocity(traj: Trajectory, frequency: float, backend: ModuleType = jnp):
+def recalculate_traj_linear_velocity(traj: Trajectory, frequency: float, backend: ModuleType = jnp,
+                                     velocity_max_horizon: int = 3):
     """
-    Recalculate the linear velocity of the trajectory.
-    qvel: free joint 3 linear (global) + 3 angular (local), hinge joint 1xn
+    Recalculate the linear velocity of the trajectory (global frame).
+    velocity_max_horizon>1 applies multi-horizon-min noise filtering (default on); =1 is a plain backward diff.
     """
-    linear_vel = (traj.data.qpos[1:, :3] - traj.data.qpos[:-1, :3]) * frequency
+    linear_vel = _mhm_backward(traj.data.qpos[:, :3], frequency, velocity_max_horizon, backend)
 
     if backend == jnp:
         qvel = traj.data.qvel.at[1:, :3].set(linear_vel)
@@ -1171,14 +1194,13 @@ def recalculate_traj_linear_velocity(traj: Trajectory, frequency: float, backend
 
     return traj
 
-def recalculate_traj_joint_velocity(traj: Trajectory, frequency: float, backend: ModuleType = jnp):
+def recalculate_traj_joint_velocity(traj: Trajectory, frequency: float, backend: ModuleType = jnp,
+                                    velocity_max_horizon: int = 3):
     """
-    Recalculate the joint velocity of the trajectory.
-    qvel: free joint 3 linear (global) + 3 angular (local), hinge joint 1xn
+    Recalculate the hinge-joint velocity of the trajectory.
+    velocity_max_horizon>1 applies multi-horizon-min noise filtering (default on); =1 is a plain backward diff.
     """
-
-    joint_pos = traj.data.qpos[:, 7:]
-    joint_vel = (joint_pos[1:] - joint_pos[:-1]) * frequency
+    joint_vel = _mhm_backward(traj.data.qpos[:, 7:], frequency, velocity_max_horizon, backend)
 
     if backend == jnp:
         qvel = traj.data.qvel.at[1:, 6:].set(joint_vel)
@@ -1281,6 +1303,8 @@ def interpolate_trajectories(traj_data: TrajectoryData, traj_info: TrajectoryInf
         qpos = qpos.at[:, qpos_other_ids].set(interp1d(x, traj_data_slice.qpos[:, qpos_other_ids], kind="cubic", axis=0)(x_new))
         for quat_ids in qpos_free_joint_quat_ids:
             quat_ids = backend.array(quat_ids)
+            # NB: SLERP is invariant to WXYZ/XYZW component labeling (geodesic interpolation on the 4D
+            # quaternion sphere; the mislabel cancels between from_quat and as_quat), so no reorder needed.
             qpos = qpos.at[:, quat_ids].set(slerp_batch(traj_data_slice.qpos[:, quat_ids], x, x_new))
 
         # interpolate the rest of the data
