@@ -88,8 +88,13 @@ def main():
             data=TrajectoryData(qpos=jp.asarray(qpos),qvel=jp.asarray(qvel),xpos=jp.asarray(kin["xpos"]),
                 xquat=jp.asarray(kin["xquat"]),cvel=jp.asarray(kin["cvel"]),subtree_com=jp.asarray(kin["subtree_com"]),
                 site_xpos=jp.asarray(kin["site_xpos"]),site_xmat=jp.asarray(kin["site_xmat"]),split_points=jp.asarray([0,T]))
-            traj=Trajectory(info=replace(template.info,frequency=fps),data=data); traj.save(out)
-            traj=env.extend_motion(traj,smooth_start_end=False); traj.save(out)   # interp to env dt + replay
+            traj=Trajectory(info=replace(template.info,frequency=fps),data=data)
+            traj=env.extend_motion(traj,smooth_start_end=False)                   # interp to env dt + replay
+            # ATOMIC write: save once (post-extend) to a temp path then rename, so a file at `out` always means
+            # FULLY converted. The old two-save pattern (native fps save, then extend, then env-fps save) was
+            # non-atomic: a crash between saves left a half-converted native-fps clip that --skip-existing then
+            # froze in place, yielding stale per-clip frequencies that break TrajectoryData.concatenate.
+            tmp=out[:-4]+".tmp.npz"; traj.save(tmp); os.replace(tmp,out)   # tmp ends .npz so np.savez won't re-append
             print(f"[p2ot] {name}: T={T} fps={fps:.1f} -> {out} complete={traj.data.is_complete}",flush=True)
         except Exception as e:
             print(f"[p2ot-ERR] {name}: {type(e).__name__} {str(e)[:150]}",flush=True)

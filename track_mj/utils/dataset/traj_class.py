@@ -189,10 +189,13 @@ class TrajectoryInfo:
             if not backend.array_equal(self.site_name2ind[key], other.site_name2ind[key]):
                 return False
 
-        # Compare other attributes
+        # Compare other attributes. frequency is compared with a tolerance: it is a float produced by fps
+        # resampling arithmetic, so two trajectories at the same nominal rate can differ by ULP-level rounding
+        # (e.g. 50.0 vs 50.00000111758712). Exact == turned that benign difference into a fatal concatenate
+        # assert; np.isclose(rtol=1e-6) accepts rounding noise while still rejecting real rate mismatches (30 vs 50).
         return (
                 self.joint_names == other.joint_names
-                and self.frequency == other.frequency
+                and bool(np.isclose(self.frequency, other.frequency, rtol=1e-6, atol=0.0))
                 and self.model == other.model
                 and self.body_names == other.body_names
                 and self.site_names == other.site_names
