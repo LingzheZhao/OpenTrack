@@ -57,6 +57,10 @@ class Args:
     num_evals: Optional[int] = None
     training_metrics_steps: Optional[int] = None
     max_devices_per_host: Optional[int] = None
+    # optional network-size overrides (None = keep the task config's default). Used to compare the
+    # HG-paper policy/value net [512,256,128] against OpenTrack's deeper default (512,512,256,256,128).
+    policy_hidden_layer_sizes: Optional[tuple] = None
+    value_hidden_layer_sizes: Optional[tuple] = None
     disable_wandb: bool = False
     save_checkpoints: bool = True
 
@@ -122,6 +126,10 @@ def _apply_policy_args_to_config(args: Args, cfg, debug: bool):
         cfg.training_metrics_steps = args.training_metrics_steps
     if args.max_devices_per_host is not None:
         cfg.max_devices_per_host = args.max_devices_per_host
+    if args.policy_hidden_layer_sizes is not None:
+        cfg.network_factory.policy_hidden_layer_sizes = tuple(args.policy_hidden_layer_sizes)
+    if args.value_hidden_layer_sizes is not None:
+        cfg.network_factory.value_hidden_layer_sizes = tuple(args.value_hidden_layer_sizes)
     if debug:
         cfg.training_metrics_steps = 1000
         cfg.num_evals = 0           # NOTE: not implemented. 2: init eval & last eval
