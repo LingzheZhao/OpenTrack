@@ -63,6 +63,9 @@ class Args:
     value_hidden_layer_sizes: Optional[tuple] = None
     disable_wandb: bool = False
     save_checkpoints: bool = True
+    # restore a saved checkpoint's params before training (used for DR-env rollout eval of a checkpoint:
+    # set num_timesteps to ~1 iteration + num_evals>=1, and the step-0 eval reflects the restored policy).
+    restore_checkpoint_path: Optional[str] = None
 
     obs_noise_level: float = 1.0
     history_len: int = 0
@@ -221,6 +224,11 @@ def _progress(num_steps, metrics, times, total_steps, debug_mode, log_wandb):
         except Exception as e:
             logging.warning(f"wandb.log failed: {e}")
 
+    if metrics:  # surface DR-env rollout eval metrics to the log (esp. the step-0 restored-policy eval)
+        ev = {k: float(v) for k, v in metrics.items() if "eval/" in k}
+        if ev:
+            logging.info(f"DR_EVAL step={num_steps} {ev}")
+
     if len(times) < 2 or num_steps == 0:
         return
     step_times = np.diff(times)
@@ -332,6 +340,8 @@ def train(args: Args):
         assert policy_cfg.randomization_fn == None
 
     policy_params = _prepare_training_params(policy_cfg, ckpt_path, save_checkpoints=args.save_checkpoints)
+    if getattr(args, "restore_checkpoint_path", None):
+        policy_params["restore_checkpoint_path"] = args.restore_checkpoint_path
 
     if not debug_mode and not args.disable_wandb:
         _init_wandb(args, exp_name, env_class, task_cfg, ckpt_path)
