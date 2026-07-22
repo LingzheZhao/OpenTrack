@@ -15,6 +15,7 @@ from mujoco_playground._src import mjx_env
 from track_mj.utils.mjx_backend import geoms_colliding, mjx_impl
 
 import track_mj as tmj
+from track_mj.envs.g1_observation_keys import G1_TRACKING_OBS_KEYS
 from track_mj.envs.g1_tracking.train import base_env as g1_base
 from track_mj.envs.g1_tracking import g1_tracking_constants as consts
 from track_mj.utils.dataset.traj_class import (
@@ -143,17 +144,7 @@ def g1_tracking_general_task_config() -> config_dict.ConfigDict:
             magnitude_range=[0.1, 1.0],
         ),
         obs_scales_config=config_dict.create(joint_vel=0.05, dif_joint_vel=0.05),
-        obs_keys=[
-            "dif_joint_pos",
-            "dif_joint_vel",
-            "gvec_pelvis",
-            "gyro_pelvis",
-            "joint_pos",
-            "joint_vel",
-            "last_motor_targets",
-            "ref_feet_height",
-            "ref_root_height",
-        ],
+        obs_keys=list(G1_TRACKING_OBS_KEYS),
         privileged_obs_keys=[
             "gyro_pelvis",
             "gvec_pelvis",

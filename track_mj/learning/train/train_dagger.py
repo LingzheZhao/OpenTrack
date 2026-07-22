@@ -44,6 +44,7 @@ from brax.training.agents.ppo.networks import make_ppo_networks
 import track_mj as tmj
 from track_mj import update_file_handler
 from track_mj.constant import WANDB_PATH_LOG
+from track_mj.envs.g1_observation_keys import G1_TRACKING_OBS_KEYS
 from track_mj.envs.g1_tracking_dagger.utils.wrapper import wrap_fn
 from track_mj.dr.domain_randomize_tracking_dagger import (
     domain_randomize,
@@ -290,17 +291,7 @@ def _apply_env_args_to_config(
 
     # Modify obs keys according to policy type
     if args.policy.policy_type in ["mlp"]:
-        env_cfg.obs_keys = [
-                "dif_joint_pos",
-                "dif_joint_vel",
-                "gvec_pelvis",
-                "gyro_pelvis",
-                "joint_pos",
-                "joint_vel",
-                "last_motor_targets",
-                "ref_feet_height",
-                "ref_root_height",
-            ]
+        env_cfg.obs_keys = list(G1_TRACKING_OBS_KEYS)
         env_cfg.auxiliary_obs_keys = []
     
     # env_cfg.privileged_obs_keys = env_cfg.privileged_obs_keys
