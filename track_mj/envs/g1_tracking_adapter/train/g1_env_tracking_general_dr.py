@@ -153,8 +153,8 @@ def g1_tracking_general_dr_task_config() -> config_dict.ConfigDict:
             "joint_pos",
             "joint_vel",
             "last_motor_targets",
-            "ref_root_height",
             "ref_feet_height",
+            "ref_root_height",
         ],
         privileged_obs_keys=[
             "gyro_pelvis",

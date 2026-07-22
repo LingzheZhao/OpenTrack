@@ -291,15 +291,15 @@ def _apply_env_args_to_config(
     # Modify obs keys according to policy type
     if args.policy.policy_type in ["mlp"]:
         env_cfg.obs_keys = [
-                "gyro_pelvis",
+                "dif_joint_pos",
+                "dif_joint_vel",
                 "gvec_pelvis",
+                "gyro_pelvis",
                 "joint_pos",
                 "joint_vel",
                 "last_motor_targets",
-                "dif_joint_pos",
-                "dif_joint_vel",
-                "ref_root_height",
                 "ref_feet_height",
+                "ref_root_height",
             ]
         env_cfg.auxiliary_obs_keys = []
     
