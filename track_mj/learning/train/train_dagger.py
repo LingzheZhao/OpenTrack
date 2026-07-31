@@ -87,6 +87,21 @@ class Args:
 
     use_ddp: bool = False
 
+    # ===== DDP communication options (only used when --use-ddp) =====
+    # Scheduling-only options, all OFF by default: on the shipped 2.14M-parameter student they were
+    # measured to buy nothing (the per-step all-reduces are latency, not bandwidth). Worth trying if
+    # the student is scaled up by an order of magnitude. See dagger_horizon.wrap_ddp for what each
+    # one does to reproducibility -- static_graph is bit-identical, grad_as_bucket_view is not.
+    ddp_grad_as_bucket_view: bool = False
+    ddp_static_graph: bool = False
+    ddp_bucket_cap_mb: int = 0          # 0 = torch default (25 MB)
+    # Semantics-CHANGING, opt-in. "per_update" = upstream: every one of the dagger_learning_epochs
+    # optimizer steps is synchronised. "local_avg" = each rank takes all dagger_learning_epochs steps
+    # on its own gradients under no_sync(), then parameters and AdamW moments are averaged once per
+    # training step (local SGD / post-local averaging). "local_avg" optimises a different objective;
+    # validate the loss curve against "per_update" before using it.
+    ddp_sync_mode: str = "per_update"
+
     policy_type: str = "mlp"
     student_obs_frame: str = "local"   # "actor_root" / "local"
     dagger_config_path: str = ""
@@ -501,6 +516,10 @@ def train(args: Args):
         student_use_residual_action = args.student_use_residual_action,
         dagger_horizon = args.dagger_horizon,
         dagger_learning_epochs = args.dagger_learning_epochs,
+        ddp_grad_as_bucket_view = args.ddp_grad_as_bucket_view,
+        ddp_static_graph = args.ddp_static_graph,
+        ddp_bucket_cap_mb = args.ddp_bucket_cap_mb,
+        ddp_sync_mode = args.ddp_sync_mode,
         progress_fn=lambda s, m: _progress(
             num_steps=s,
             metrics=m,
