@@ -139,6 +139,160 @@ def auto_set_barrier(use_ddp):
         dist.barrier()
 
 
+DDP_SYNC_MODES = ("per_update", "local_avg")
+
+
+def wrap_ddp(
+    model: torch.nn.Module,
+    grad_as_bucket_view: bool = False,
+    static_graph: bool = False,
+    bucket_cap_mb: int = 0,
+    sync_mode: str = "per_update",
+) -> DDP:
+    """Wrap `model` in DDP, optionally with communication options that only affect scheduling.
+
+    All three options are OFF by default because they were measured to buy nothing on the shipped
+    2.14M-parameter student (`mlp_hidden_dim=[1024,1024,512,512,256]`, 8.55 MB of gradient): at that
+    size the ten per-step all-reduces are latency, not bandwidth, and there is nothing for bucketing
+    to overlap. They are kept because the regime changes for a much larger student -- `policy_args.py`
+    carries a commented-out ~30M-parameter head, where ten all-reduces move ~1.2 GB per training step.
+
+    `static_graph=True` lets DDP record the autograd execution order once and reuse it. It is valid
+    here only because the student is a fixed MLP: every parameter gets a gradient on every backward
+    and the graph never changes shape. Verified bit-for-bit identical to plain
+    ``DDP(model, device_ids=[0])``. It is mutually exclusive with ``no_sync()``, so it is forced off
+    for the ``local_avg`` sync mode (see `run_update_epochs`).
+
+    `gradient_as_bucket_view=True` produces the SAME reduced gradient (a one-step, one-epoch run is
+    bit-identical) but makes ``param.grad`` a view into the flat communication bucket, which changes
+    the memory the AdamW elementwise kernels operate on. That perturbs the update at ~1 ulp per step
+    (measured 2.98e-8 after a single training step) and amplifies over hundreds of Adam steps, so a
+    run with it on is NOT reproducible against a run with it off. Enable it deliberately, not by
+    habit; see `scripts/check_dagger_ddp_sync.py --check equivalence`.
+    """
+    if sync_mode not in DDP_SYNC_MODES:
+        raise ValueError(f"Unknown ddp_sync_mode: {sync_mode}. Supported: {list(DDP_SYNC_MODES)}")
+
+    kwargs = dict(device_ids=[0])
+    if grad_as_bucket_view:
+        kwargs["gradient_as_bucket_view"] = True
+    if bucket_cap_mb and bucket_cap_mb > 0:
+        kwargs["bucket_cap_mb"] = bucket_cap_mb
+    if static_graph:
+        if sync_mode == "local_avg":
+            logging.info("[DDP] ddp_sync_mode=local_avg uses no_sync(); forcing static_graph=False")
+        else:
+            kwargs["static_graph"] = True
+
+    logging.info(f"[DDP] wrapping student model with {kwargs}, sync_mode={sync_mode}")
+    return DDP(model, **kwargs)
+
+
+@torch.no_grad()
+def average_parameters_across_ranks_(
+    model: torch.nn.Module,
+    optimizer: Optional[optim.Optimizer] = None,
+    world_size: int = 1,
+) -> None:
+    """In-place average of parameters (and AdamW moments) over ranks, in one flat all-reduce.
+
+    Used only by the opt-in ``local_avg`` sync mode. Everything that has to stay identical across
+    ranks is packed into a single flat buffer per dtype -- normally exactly one -- so the cost is one
+    collective per training step instead of one per optimizer step, and it does not grow with the
+    number of parameter tensors. Averaging the optimizer moments as well as the weights keeps
+    the whole optimizer state identical across ranks, so ranks re-enter the next training step from
+    exactly the same point.
+    """
+    if world_size <= 1:
+        return
+
+    tensors: List[torch.Tensor] = [p.data for p in model.parameters()]
+    if optimizer is not None:
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                state = optimizer.state.get(p, {})
+                for key in ("exp_avg", "exp_avg_sq"):
+                    buf = state.get(key, None)
+                    if isinstance(buf, torch.Tensor) and buf.is_floating_point():
+                        tensors.append(buf)
+    if not tensors:
+        return
+
+    by_dtype: Dict[torch.dtype, List[torch.Tensor]] = defaultdict(list)
+    for t in tensors:
+        by_dtype[t.dtype].append(t)
+
+    for group_tensors in by_dtype.values():          # one collective per dtype (normally exactly one)
+        flat = torch.cat([t.reshape(-1) for t in group_tensors])
+        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+        flat.div_(world_size)
+        offset = 0
+        for t in group_tensors:
+            n = t.numel()
+            t.copy_(flat[offset:offset + n].view_as(t))
+            offset += n
+
+
+def run_update_epochs(
+    student_nn,
+    optimizer: optim.Optimizer,
+    nn_state_dict_th_batch: dict,
+    teacher_action_th_batch: torch.Tensor,
+    aux_loss_info: dict,
+    num_epochs: int,
+    max_grad_norm: float,
+    use_ddp: bool,
+    world_size: int,
+    sync_mode: str = "per_update",
+):
+    """Run `num_epochs` optimizer steps on the (fixed) DAgger batch.
+
+    Two modes, and they are NOT the same algorithm:
+
+    * ``per_update`` (default, upstream behaviour): every one of the `num_epochs` steps synchronises.
+      Each step's gradient is the world-averaged gradient at the previous step's updated weights, so
+      all ranks stay bit-identical throughout. Cost under DDP: `num_epochs` all-reduces per training
+      step.
+
+    * ``local_avg`` (opt-in): each rank runs the same `num_epochs` steps on its OWN gradients inside
+      ``no_sync()``, and the ranks are re-synchronised once at the end by averaging parameters and
+      optimizer moments. Cost: one all-reduce per training step. Ranks are identical at every
+      training-step boundary, but the intermediate steps are taken on local (per-rank) gradients, so
+      this optimises a different objective than ``per_update`` -- it is local SGD / post-local
+      averaging, not a faster way to compute the same update. Never enable it without checking that
+      the loss tracks the ``per_update`` baseline.
+
+    NOTE on a fix that looks obvious and is not: accumulating the `num_epochs` backward passes under
+    ``no_sync()`` and taking ONE synchronised step does not work here. The batch is fixed and the
+    student forward is deterministic (no dropout, no batchnorm, no sampling), so the weights do not
+    change between accumulated passes and all `num_epochs` gradients are IDENTICAL. Accumulating them
+    yields exactly `num_epochs` x the single-pass gradient, i.e. the run is `dagger_learning_epochs=1`
+    with a rescaled gradient, at `num_epochs` x the compute. Use ``--dagger-learning-epochs 1`` if
+    that is what is wanted; there is no reason to spend the extra passes.
+    """
+    params_for_clip = student_nn.model.module.parameters() if use_ddp else student_nn.model.parameters()
+    params_for_clip = list(params_for_clip)
+
+    def _one_epoch():
+        loss, info_student = student_nn.compute_loss(nn_state_dict_th_batch, teacher_action_th_batch, aux_loss_info)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params_for_clip, max_grad_norm)
+        optimizer.step()
+        return loss, info_student
+
+    if use_ddp and sync_mode == "local_avg":
+        with student_nn.model.no_sync():
+            for _ in range(num_epochs):
+                loss, info_student = _one_epoch()
+        average_parameters_across_ranks_(student_nn.model.module, optimizer, world_size)
+    else:
+        for _ in range(num_epochs):
+            loss, info_student = _one_epoch()
+
+    return loss, info_student
+
+
 # ==============================================================================================
 # Teacher Utils
 # ==============================================================================================
@@ -291,6 +445,13 @@ def dagger(
     student_use_residual_action: bool = True,
     dagger_horizon: int = 1,
     dagger_learning_epochs: int = 10,
+    # DDP communication options. The first three only affect how the all-reduce is scheduled and are
+    # off by default (see `wrap_ddp`); `ddp_sync_mode` changes the algorithm and defaults to the
+    # upstream behaviour (see `run_update_epochs`).
+    ddp_grad_as_bucket_view: bool = False,
+    ddp_static_graph: bool = False,
+    ddp_bucket_cap_mb: int = 0,
+    ddp_sync_mode: str = "per_update",
     progress_fn: Optional[Callable] = None,
 
     policy_args: PolicyArgs = PolicyArgs(),
@@ -324,6 +485,8 @@ def dagger(
             f"seed={seed}, "
             f"num_envs_per_rank={num_envs_per_rank} "
             f"(global={num_envs_per_rank * world_size}), "
+            f"lr={lr}, "
+            f"sync_mode={ddp_sync_mode}, "
         )
     else:
         logging.info(
@@ -331,7 +494,16 @@ def dagger(
             f"device={device}, "
             f"seed={seed}, "
             f"num_envs={num_envs_per_rank}, "
-        )        
+            f"lr={lr}, "
+        )
+    # `lr` is used exactly as given: it is NEVER rescaled by the actual world_size. The CLI default in
+    # train_dagger.py is written `1e-4 * 8`, i.e. the base rate pre-scaled for a world_size of 8 (and
+    # `num_envs` defaults to `2048 * 8`, a GLOBAL count). A run at a different world_size or a
+    # different global env count therefore inherits a learning rate that was scaled for neither.
+    logging.info(
+        f"[LR] lr={lr} is used as given (no world_size scaling); "
+        f"world_size={world_size}, global_num_envs={num_envs_per_rank * world_size}"
+    )
 
     # ====== TorchJax Environment ======
 
@@ -366,9 +538,16 @@ def dagger(
     student_nn = get_policy(policy_args)
     student_nn.model.to(device)
     if use_ddp:
-        student_nn.model = DDP(student_nn.model, device_ids=[0])    # each process only sees one GPU， we have set CUDA_VISIBLE_DEVICES already (if use_ddp)
+        # each process only sees one GPU， we have set CUDA_VISIBLE_DEVICES already (if use_ddp)
+        student_nn.model = wrap_ddp(
+            student_nn.model,
+            grad_as_bucket_view=ddp_grad_as_bucket_view,
+            static_graph=ddp_static_graph,
+            bucket_cap_mb=ddp_bucket_cap_mb,
+            sync_mode=ddp_sync_mode,
+        )
         if rank == 0:
-            print(f"Model wrapped with DDP on rank {rank}")
+            print(f"Model wrapped with DDP on rank {rank} (sync_mode={ddp_sync_mode})")
     auto_set_barrier(use_ddp)
 
     optimizer = optim.AdamW(student_nn.model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -503,6 +682,13 @@ def dagger(
                 # dones_th_list[h] indicates dones AFTER step h, used to determine if step h and h+1 are in same episode
                 dones_th_list.append(torch_from_dlpack(state_tj.state_mjx.info["episode_done"]).bool())
 
+        # Wait for the slowest rank's rollout BEFORE the update, and charge that wait to its own
+        # section. Left inside "2.optimizer_step" (as it was) it makes per-rank rollout skew look
+        # like optimizer/collective cost, which is what made the update loop appear to grow with
+        # rank count even as the per-rank batch shrank.
+        with perf_timer.timer("2.rank_skew_wait"):
+            auto_set_barrier(use_ddp)
+
         # Compute loss
         with perf_timer.timer("2.optimizer_step"):
             # process student state_dict: [B, H, ...] -> [B*H, ...]
@@ -522,19 +708,18 @@ def dagger(
                 dones_list=dones_th_list,
             )
 
-            auto_set_barrier(use_ddp)
-            
-            for _ in range(dagger_learning_epochs):
-                # compute loss
-                loss, info_student = student_nn.compute_loss(nn_state_dict_th_batch, teacher_action_th_batch, aux_loss_info)
-                # update model
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    student_nn.model.parameters() if not use_ddp else student_nn.model.module.parameters(),
-                    max_grad_norm
-                )
-                optimizer.step()
+            loss, info_student = run_update_epochs(
+                student_nn=student_nn,
+                optimizer=optimizer,
+                nn_state_dict_th_batch=nn_state_dict_th_batch,
+                teacher_action_th_batch=teacher_action_th_batch,
+                aux_loss_info=aux_loss_info,
+                num_epochs=dagger_learning_epochs,
+                max_grad_norm=max_grad_norm,
+                use_ddp=use_ddp,
+                world_size=world_size,
+                sync_mode=ddp_sync_mode,
+            )
             scheduler.step()
 
         # Handle episode completion and logging

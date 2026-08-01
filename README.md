@@ -185,6 +185,21 @@ The checkpoints are trained with simple domain randomization (DR). You may try t
 
   For an example DAgger config, please refer to `storage/training_configs/dagger/demo.json`.
 
+  **A note on what extra GPUs buy here.** `--training.num-envs` is a GLOBAL count: `dagger_horizon.py`
+  splits it as `num_envs // world_size`, and the shipped default (`2048 * 8`) is written as
+  "2048 envs per GPU x 8 GPUs". Adding ranks at a *fixed* global env count therefore shrinks the
+  per-rank batch while leaving the per-training-step synchronisation structure unchanged
+  (`dagger_learning_epochs` sequential optimizer steps, each an all-reduce, plus one barrier), and
+  every rank waits for the slowest rollout once per step. Measured on one 8x RTX 3090 node, one
+  allocation, 400 steps per phase, global 1024 envs, only the rank count moving: 1 rank 0.426 s/step,
+  2 ranks 0.513, 4 ranks 0.556, 8 ranks 0.757. Use extra GPUs to *raise* the global env count, which
+  is what they are for; do not expect them to make a fixed env count finish sooner.
+
+  `scripts/check_dagger_ddp_sync.py` measures the update loop on its own (no simulator), checks that
+  the default DDP path is bit-for-bit identical to the single-process one, and documents
+  `--ddp-sync-mode local_avg`, an opt-in mode that synchronises once per training step instead of
+  once per optimizer step. `local_avg` changes the optimisation and is off by default.
+
   In our experiments, we found that our specialist-to-generalist training framework is a flexible, controllable, and scalable approach for building a general tracker. Different teachers can be flexibly assigned to different categories of motions to maximize tracking quality. As long as you have a specialist teacher, you can seamlessly distill its capabilities into a generalist student. The capabilities of different teachers can be perfectly inherited by the student. The student’s performance improves significantly with more motion data, more teachers, longer training time, and larger model capacity.
 
 ### Train the adapter:
