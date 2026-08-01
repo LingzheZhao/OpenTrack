@@ -24,7 +24,7 @@ from track_mj.learning.models.dagger.policy_args import PolicyArgs
 from typing import Optional
 from dataclasses import dataclass, field
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from absl import logging
 from typing import Any, Callable, Optional, Tuple
 import tqdm
@@ -117,7 +117,26 @@ class Args:
 
 
 def get_ddp_params():
-    dist.init_process_group("nccl", device_id=0)
+    # NCCL's default process-group timeout is 10 minutes, and the FIRST collective is the 1-element
+    # ALLREDUCE inside DDP.__init__ (_verify_param_shape_across_processes). Every rank reaches it right
+    # after building its own reference set, and there is no barrier before the wrap -- the one in
+    # dagger_horizon sits after DDP construction, not before it. Reference building is I/O-bound and its
+    # duration varies per rank, so the whole arrival spread has to fit inside that 10 minutes, and the
+    # spread grows with world size.
+    #
+    # Measured, 8 ranks on a shared NFS mount: ranks finished their reference builds over a 5m14s window
+    # and the watchdog then aborted the job with
+    #     Watchdog caught collective operation timeout: WorkNCCL(SeqNum=7, OpType=ALLREDUCE, NumelIn=1, ...)
+    # Two consecutive 8-rank runs died this way on a configuration a third had completed, i.e. it is
+    # intermittent rather than deterministic. 1- and 3-rank runs never hit it.
+    #
+    # Widening the timeout only bounds how long a genuinely HUNG collective takes to surface; it does not
+    # slow a healthy one and changes no numerics.
+    dist.init_process_group(
+        "nccl",
+        device_id=0,
+        timeout=timedelta(minutes=int(os.environ.get("DAGGER_DDP_TIMEOUT_MIN", "90"))),
+    )
     world_size = int(os.environ.get("WORLD_SIZE"))
     rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(0)
