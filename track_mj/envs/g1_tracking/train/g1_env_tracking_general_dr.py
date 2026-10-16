@@ -12,6 +12,7 @@ from mujoco import MjData, mjx
 from mujoco.mjx._src import math
 from mujoco_playground._src import mjx_env
 from track_mj.utils.mjx_backend import geoms_colliding, mjx_impl
+from track_mj.envs.evaluation import copy_state_containers
 
 import track_mj as tmj
 from track_mj.envs.g1_observation_keys import G1_TRACKING_OBS_KEYS
@@ -360,6 +361,18 @@ class G1TrackingGeneralDREnv(g1_env_tracking_general.G1TrackingGeneralEnv):
         return mjx_env.State(data, obs, reward, done, metrics, info)
 
     def step(self, state: mjx_env.State, action: jax.Array, trajectory_data: TrajectoryData = None) -> mjx_env.State:
+        """Native training step, including its established automatic-reset policy."""
+        return self._step(state, action, trajectory_data, auto_reset=True)
+
+    def step_no_autoreset(self, state: mjx_env.State, action: jax.Array,
+                          trajectory_data: TrajectoryData = None) -> mjx_env.State:
+        """The same physical advance and observations, retaining the terminal state."""
+        return self._step(state, action, trajectory_data, auto_reset=False)
+
+    def _step(self, state: mjx_env.State, action: jax.Array, trajectory_data: TrajectoryData,
+              *, auto_reset: bool) -> mjx_env.State:
+        if not auto_reset:
+            state = copy_state_containers(state)
         if trajectory_data is None:
             trajectory_data = self.th.traj.data
 
@@ -448,6 +461,8 @@ class G1TrackingGeneralDREnv(g1_env_tracking_general.G1TrackingGeneralEnv):
             state.info["previous_obs"] = jp.concatenate([state.info["previous_obs"][1:], history[None, :]], axis=0)
 
         state = state.replace(data=data, obs=obs, reward=reward, done=done)
+        if not auto_reset:
+            return state
         # MJX-Warp reset is handled after vectorization in the training wrapper.
         if mjx_impl(self._config) != "warp":
             state = jax.lax.cond(
