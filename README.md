@@ -185,6 +185,16 @@ The checkpoints are trained with simple domain randomization (DR). You may try t
 
   For an example DAgger config, please refer to `storage/training_configs/dagger/demo.json`.
 
+  DAgger reports batch preparation, the pre-update rank barrier (`2.rank_skew_wait`), and
+  optimizer updates as separate timing sections. Their execution order is unchanged. These are
+  host wall-clock intervals with no added device synchronization; the barrier interval includes
+  its existing synchronization cost and should not be read as a pure measure of rank arrival skew.
+  Earlier logs included all three sections in `2.optimizer_step`.
+
+  `--training.num-envs` is the global requested count, divided across ranks with integer division.
+  The startup log reports the effective global count, world size, and learning rate. The learning
+  rate is used as configured, with no runtime scaling by world size.
+
   In our experiments, we found that our specialist-to-generalist training framework is a flexible, controllable, and scalable approach for building a general tracker. Different teachers can be flexibly assigned to different categories of motions to maximize tracking quality. As long as you have a specialist teacher, you can seamlessly distill its capabilities into a generalist student. The capabilities of different teachers can be perfectly inherited by the student. The student’s performance improves significantly with more motion data, more teachers, longer training time, and larger model capacity.
 
 ### Train the adapter:
