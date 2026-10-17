@@ -1,6 +1,6 @@
 """Manual, bounded native JAX positive-contact comparison; excluded from test discovery.
 
-Run only as a compute-service job. No policy training, reference replay, native
+Run in the provisioned GPU environment. No policy training, reference replay, native
 forward refresh, tolerance verdict, or full-clip qualification is performed.
 """
 from __future__ import annotations
@@ -143,7 +143,10 @@ def run(args, report):
     config.reference_traj_config.random_start = False
     config.reference_traj_config.fixed_start_frame = args.start_frame
     config.push_config.enable = False
-    config.mjx = ConfigDict({"impl": "jax", "num_envs": 1})
+    if not hasattr(config, "mjx"):
+        config.mjx = ConfigDict()
+    config.mjx.impl = "jax"
+    config.mjx.num_envs = 1
     configure_mjx(config, 1)
     if mjx_impl(config) != "jax":
         raise ValueError("diagnostic requires native JAX; remove conflicting backend environment overrides")
