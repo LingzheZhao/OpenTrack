@@ -50,6 +50,16 @@ class ContactReportTests(unittest.TestCase):
         self.assertEqual(result["nonfinite_left"], {"native_cache": 1})
         self.assertEqual(result["nonfinite_right"], {"native_cache": 1})
 
+    def test_native_json_negative_exponent_weights_remain_floats(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            config = Path(scratch) / "config.json"
+            config.write_text('{"env_config":{"reward_config":{"scales":'
+                              '{"penalty_torque":-2e-05,"smoothness_joint":-1e-06}}}}')
+            scales = diagnostic.read_native_config(config)["env_config"]["reward_config"]["scales"]
+        self.assertIsInstance(scales["penalty_torque"], float)
+        self.assertIsInstance(scales["smoothness_joint"], float)
+        self.assertEqual(scales, {"penalty_torque": -2e-5, "smoothness_joint": -1e-6})
+
     def test_external_interrupts_write_a_report_and_remain_interrupts(self):
         for number in (signal.SIGTERM, signal.SIGINT):
             with self.subTest(signal=number), tempfile.TemporaryDirectory() as scratch:

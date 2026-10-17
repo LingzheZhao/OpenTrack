@@ -126,19 +126,23 @@ def save_capture(root, name, value):
                                                        "nonfinite_leaves": nonfinite_counts(value.arrays)})
 
 
+def read_native_config(path):
+    """Read the native JSON configuration without YAML scalar reinterpretation."""
+    return json.loads(path.read_text())
+
+
 def run(args, report):
     # Actual native imports, deferred so --help and reporting unit tests construct no physics.
     import jax
     import jax.numpy as jp
     import mujoco
     from ml_collections import ConfigDict
-    import yaml
     from track_mj.envs.g1_tracking_dagger.train.g1_env_tracking_general import G1TrackingGeneralEnv
     from track_mj.envs.g1_tracking_dagger.utils.wrapper import VmapWrapper
     from track_mj.utils.dataset.preparation import load_prepared_trajectory
     from track_mj.utils.mjx_backend import MJX_WORLD_AXIS_NAME, configure_mjx, mjx_impl
 
-    document = yaml.safe_load(args.config.read_text())
+    document = read_native_config(args.config)
     config = ConfigDict(document.get("env_config", document))
     config.reference_traj_config.random_start = False
     config.reference_traj_config.fixed_start_frame = args.start_frame
@@ -257,7 +261,7 @@ def run(args, report):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--config", type=Path, required=True, help="native JSON configuration")
     parser.add_argument("--motion", type=Path, required=True, help="immutable prepared native trajectory")
     parser.add_argument("--out", type=Path, required=True, help="new output directory")
     parser.add_argument("--source-reference", required=True)
