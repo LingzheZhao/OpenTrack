@@ -333,6 +333,11 @@ def dagger(
             f"num_envs={num_envs_per_rank}, "
         )        
 
+    logging.info(
+        f"[LR] lr={lr} is used as given (no world_size scaling); "
+        f"world_size={world_size}, global_num_envs={num_envs_per_rank * world_size}"
+    )
+
     # ====== TorchJax Environment ======
 
     if rank == 0:
@@ -503,8 +508,9 @@ def dagger(
                 # dones_th_list[h] indicates dones AFTER step h, used to determine if step h and h+1 are in same episode
                 dones_th_list.append(torch_from_dlpack(state_tj.state_mjx.info["episode_done"]).bool())
 
-        # Compute loss
-        with perf_timer.timer("2.optimizer_step"):
+        # Preserve the preparation/barrier/update order while separating their host wall times.
+        # These timers add no device synchronization and are not GPU kernel timings.
+        with perf_timer.timer("2.batch_preparation"):
             # process student state_dict: [B, H, ...] -> [B*H, ...]
             nn_state_dict_th_batch = {}
             for key in nn_state_dict_th_list[0].keys():
@@ -522,8 +528,10 @@ def dagger(
                 dones_list=dones_th_list,
             )
 
+        with perf_timer.timer("2.rank_skew_wait"):
             auto_set_barrier(use_ddp)
-            
+
+        with perf_timer.timer("2.optimizer_step"):
             for _ in range(dagger_learning_epochs):
                 # compute loss
                 loss, info_student = student_nn.compute_loss(nn_state_dict_th_batch, teacher_action_th_batch, aux_loss_info)
