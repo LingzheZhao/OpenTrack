@@ -128,25 +128,35 @@ The checkpoints are trained with simple domain randomization (DR). You may try t
 
 ## Train from scratch
 
-### [Optional] Preprocess the motion data
+### Prepare the motion data
 
-  If you want to train on your own motion data, you should first put the `.npz` files under `storage/data/mocap/<your_dataset_name>/UnitreeG1`. Then, you should run the following preprocess script to:
+  Prepare motions separately before training or evaluation. Runtime loading is read-only: it requires complete state fields at the task's control frequency (50 Hz by default) and never extends, resamples, recalculates or saves the source files. Configurations with `recalculate_vel_in_reference_motion=True`, including the released generalist configurations, require reference velocities saved by this preparation step even when the input is already complete at 50 Hz.
 
-  1. Align the frequency or the original motion data to the desired control frequency (50Hz by default).
-  2. Recalculate velocities (angular, linear, joint) and other state features based on the aligned frequency.
-  
-  **Note:** The preprocess script will overwrite the original motion files.
+  Put the source `.npz` files under `<source-root>/<dataset-name>/UnitreeG1/` and select the motions in the task's `reference_traj_config.name`. Preparation uses the existing trajectory functions to align the sampling frequency, complete state features and recalculate reference velocities when configured. It writes new artifacts under `<output-root>/<dataset-name>/UnitreeG1/`, preserves source metadata and records the source path, optional external publication reference and processing operations. Source and output roots must differ; existing output artifacts are refused.
 
   ```shell
-  # Use `num_batches` to split data into multiple batches for parallel processing on multiple GPUs. You should manually launch multiple processes on different GPUs for parallel processing.
-  python scripts/process_motion/preprocess_motion.py --task G1TrackingGeneral --num_batches XXX --smooth_start_end False
-  
-  # Or run on a single GPU without parallelism
-  python scripts/process_motion/preprocess_motion.py --task G1TrackingGeneral --num_batches 1 --smooth_start_end False
+  python scripts/process_motion/preprocess_motion.py \
+    --task G1TrackingGeneral \
+    --source-root /path/to/raw-mocap \
+    --output-root /path/to/prepared-mocap \
+    --num-batches 1 --batch-idx 0
   ```
-  
-  Argument `--smooth_start_end True` can generate a natural transition motion from the default pose before the original motion.
-  
+
+  Set `--source-reference` to the published dataset version or source ID when available. Publication pins source versions externally; preparation records that reference without computing file identities.
+
+  Use `--flat-source` if the source root contains the `.npz` files directly. To partition processing, set the same `--num-batches N` for each process and supply each `--batch-idx` from `0` through `N-1` once. All batches write distinct artifacts into the same new output tree.
+
+  Point the training or evaluation configuration at the prepared tree using the existing `reference_traj_config` field:
+
+  ```python
+  env_config.reference_traj_config.root = "/path/to/prepared-mocap"
+  # For example: /path/to/prepared-mocap/lafan1/UnitreeG1/walk1_subject1.npz
+  ```
+
+  For a saved configuration, set `env_config.reference_traj_config.root` to that same directory before constructing the environment. If the field is omitted, runtime loading uses `storage/data/mocap/`.
+
+  Smoothing is disabled by default. Add `--smooth-start-end` to explicitly prepend a transition from the default pose; use a separate output root for this variant. The prepared artifact records the smoothing parameters and the number of added prefix frames.
+
   An inverse-kinematics solver generates a smooth stepping motion from the default pose to the first motion frame. The solver uses QP optimization (OSQP) with foot position/orientation constraints and CoM balance constraints. One or two foot steps are automatically chosen based on the foot-placement gap between default pose and the pose of the first frame.
 
   Here is a comparison of the original motion and the smoothed motion:
@@ -197,6 +207,21 @@ The checkpoints are trained with simple domain randomization (DR). You may try t
   ```
 
 ## Evaluate the model
+
+Programmatic evaluation of the native tracking and DAgger training environments
+can use `step_no_autoreset(state, action, trajectory_data)`. Their matching
+`VmapWrapper` and domain-randomization vector wrapper expose this method and
+`physical_data(state)`. Use the vector wrapper directly so action repetition
+cannot hide a terminal boundary. Evaluation retains the true terminal state and
+copies the input info and metrics containers before advancing. Training `step`
+keeps its native automatic-reset policy and RNG behavior.
+
+`physical_data` runs native forward on owned endpoint data. Its refreshed
+kinematics do not replace policy observations or continuation data. The interface
+declares measured substep contact forces unavailable. Native subsequent-step
+numerical reproducibility needs separate qualification; CPU tests use fake physics
+and do not establish native engine equivalence. Reset isolation corrections are
+outside this interface.
 
 ### Evaluate the specialist teachers
 

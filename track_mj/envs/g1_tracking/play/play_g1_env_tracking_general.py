@@ -13,12 +13,10 @@ import imageio.v2 as imageio
 
 import track_mj as tmj
 from track_mj.envs.g1_tracking import g1_tracking_constants as consts
+from track_mj.utils.dataset.preparation import concatenate_prepared, load_prepared_trajectory, motion_path
 from track_mj.utils.dataset.traj_class import (
     Trajectory,
     TrajectoryData,
-    recalculate_traj_angular_velocity,
-    recalculate_traj_joint_velocity,
-    recalculate_traj_linear_velocity,
 )
 from track_mj.utils.dataset.traj_handler import TrajectoryHandler, TrajCarry
 
@@ -352,18 +350,16 @@ class PlayG1TrackingGeneralEnv:
         all_trajectories = []
         for dataset_name, traj_names in dataset_dict.items():
             print(f"Loading dataset: {dataset_name} with {len(traj_names)} trajectories.")
-            dataset_dir = os.path.join(os.getcwd(), "storage", "data", "mocap", dataset_name)
+            dataset_dir = motion_path(self._config.reference_traj_config, dataset_name, "_").parent
             for idx, t_name in enumerate(tqdm(traj_names)):
-                traj_path = os.path.join(dataset_dir, "UnitreeG1", f"{t_name}.npz")
+                traj_path = dataset_dir / f"{t_name}.npz"
                 
                 if os.path.exists(traj_path):
                     print(f"Loading trajectory {t_name} from {dataset_dir}")
-                    traj = Trajectory.load(traj_path, backend=np)
-
-                    if recalculate_vel_in_reference_motion:
-                        traj = recalculate_traj_angular_velocity(traj, frequency=1.0 / self.dt, backend=np)
-                        traj = recalculate_traj_linear_velocity(traj, frequency=1.0 / self.dt, backend=np)
-                        traj = recalculate_traj_joint_velocity(traj, frequency=1.0 / self.dt, backend=np)
+                    traj = load_prepared_trajectory(
+                        traj_path, backend=np, control_dt=self.dt,
+                        recalculate_velocity=recalculate_vel_in_reference_motion,
+                    )
                     all_trajectories.append(traj)
                     self.ref_traj_names.append([dataset_name, t_name])
                     continue
@@ -371,14 +367,7 @@ class PlayG1TrackingGeneralEnv:
             
         assert len(all_trajectories) > 0, "No valid trajectories found in the dataset."
 
-        # concatenate trajectories
-        if len(all_trajectories) == 1:
-            trajectory = all_trajectories[0]
-        else:
-            traj_datas = [t.data for t in all_trajectories]
-            traj_infos = [t.info for t in all_trajectories]
-            traj_data, traj_info = TrajectoryData.concatenate(traj_datas, traj_infos, backend=np)
-            trajectory = Trajectory(traj_info, traj_data)
+        trajectory = concatenate_prepared(all_trajectories, backend=np)
 
         # load trajectory again to ensure the latest transformed trajectories is loaded
         self.th = self.load_trajectory(trajectory, warn=False)

@@ -91,22 +91,22 @@ class Trajectory:
                 return array.dtype == object and np.all(array == None)
             return False
 
-        data = np.load(path, allow_pickle=True)
         converted_info = {}
         converted_model = {}
         converted_data = {}
         converted_transitions = {}
-        for key, value in data.items():
-            if key in TrajectoryInfo.get_attribute_names():
-                converted_info[key] = None if is_none_object_array(value) else value.tolist()
-            elif key in TrajectoryModel.get_attribute_names():
-                converted_model[key] = None if is_none_object_array(value) else backend.array(value)
-            elif key in TrajectoryData.get_attribute_names():
-                converted_data[key] = backend.array(value)
-            elif key in TrajectoryTransitions.get_attribute_names():
-                converted_transitions[key] = backend.array(value)
-            else:
-                raise ValueError(f"Unknown key {key} in the npz file.")
+        with np.load(path, allow_pickle=True) as data:
+            for key, value in data.items():
+                if key in TrajectoryInfo.get_attribute_names():
+                    converted_info[key] = None if is_none_object_array(value) else value.tolist()
+                elif key in TrajectoryModel.get_attribute_names():
+                    converted_model[key] = None if is_none_object_array(value) else backend.array(value)
+                elif key in TrajectoryData.get_attribute_names():
+                    converted_data[key] = backend.array(value)
+                elif key in TrajectoryTransitions.get_attribute_names():
+                    converted_transitions[key] = backend.array(value)
+                else:
+                    raise ValueError(f"Unknown key {key} in the npz file.")
 
         _all = {"data": TrajectoryData(**converted_data),
                 "info": TrajectoryInfo(model=TrajectoryModel(**converted_model), **converted_info)}

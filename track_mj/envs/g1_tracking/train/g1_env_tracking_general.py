@@ -13,6 +13,7 @@ from mujoco import MjData, mjx
 from mujoco.mjx._src import math
 from mujoco_playground._src import mjx_env
 from track_mj.utils.mjx_backend import geoms_colliding, mjx_impl
+from track_mj.envs.evaluation import copy_state_containers
 
 import track_mj as tmj
 from track_mj.envs.g1_observation_keys import G1_TRACKING_OBS_KEYS
@@ -22,11 +23,9 @@ from track_mj.utils.dataset.traj_class import (
     Trajectory,
     TrajectoryData,
     interpolate_trajectories,
-    recalculate_traj_angular_velocity,
-    recalculate_traj_linear_velocity,
-    recalculate_traj_joint_velocity,
 )
 from track_mj.utils.dataset.traj_handler import TrajectoryHandler, TrajCarry
+from track_mj.utils.dataset.preparation import concatenate_prepared, load_prepared_trajectory, motion_path, preprocess_dataset
 from track_mj.utils.mujoco import mj_jntname2qposid, mj_jntid2qposid
 from track_mj.utils.dataset.traj_process import ExtendTrajData, SmoothStartEndTransition
 from track_mj.utils import math as gmth
@@ -476,6 +475,18 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         return mjx_env.State(data, obs, reward, done, metrics, info)
 
     def step(self, state: mjx_env.State, action: jax.Array, trajectory_data: TrajectoryData = None) -> mjx_env.State:
+        """Native training step, including its established automatic-reset policy."""
+        return self._step(state, action, trajectory_data, auto_reset=True)
+
+    def step_no_autoreset(self, state: mjx_env.State, action: jax.Array,
+                          trajectory_data: TrajectoryData = None) -> mjx_env.State:
+        """The same physical advance and observations, retaining the terminal state."""
+        return self._step(state, action, trajectory_data, auto_reset=False)
+
+    def _step(self, state: mjx_env.State, action: jax.Array, trajectory_data: TrajectoryData,
+              *, auto_reset: bool) -> mjx_env.State:
+        if not auto_reset:
+            state = copy_state_containers(state)
         if trajectory_data is None:
             trajectory_data = self.th.traj.data
         
@@ -544,6 +555,8 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
             state.info["previous_obs"] = jp.concatenate([state.info["previous_obs"][1:], history[None, :]], axis=0)
 
         state = state.replace(data=data, obs=obs, reward=reward, done=done)
+        if not auto_reset:
+            return state
         # MJX-Warp reset is handled after vectorization in the training wrapper.
         if mjx_impl(self._config) != "warp":
             state = jax.lax.cond(
@@ -569,109 +582,38 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         all_trajectories = []
         for dataset_name, traj_names in dataset_dict.items():
             print(f"Loading dataset: {dataset_name} with {len(traj_names)} trajectories.")
-            dataset_dir = os.path.join(os.getcwd(), "storage", "data", "mocap", dataset_name)
+            dataset_dir = motion_path(self._config.reference_traj_config, dataset_name, "_").parent
 
             for idx, t_name in enumerate(tqdm(traj_names)):
                 # load the npz file
-                traj_path = os.path.join(dataset_dir, "UnitreeG1", f"{t_name}.npz")
+                traj_path = dataset_dir / f"{t_name}.npz"
 
                 if os.path.exists(traj_path):
-                    traj = Trajectory.load(traj_path, backend=jp)
-                    if not traj.data.is_complete:
-                        print(f"Trajectory {t_name} is not complete. Extending...")
-                        traj = self.extend_motion(traj, smooth_start_end=False)
-                        traj.save(traj_path)  # save trajectory before recalculating velocity
-                    print(f"Loaded trajectory {t_name}")
-
-                    # recalculate velocity
-                    if self.recalculate_vel_in_reference_motion:
-                        traj = recalculate_traj_angular_velocity(traj, frequency=1.0 / self.dt, backend=jp)
-                        traj = recalculate_traj_linear_velocity(traj, frequency=1.0 / self.dt, backend=jp)
-                        traj = recalculate_traj_joint_velocity(traj, frequency=1.0 / self.dt, backend=jp)
+                    traj = load_prepared_trajectory(
+                        traj_path, backend=jp, control_dt=self.dt,
+                        recalculate_velocity=self.recalculate_vel_in_reference_motion,
+                    )
                     all_trajectories.append(traj)
                     continue
                 raise FileNotFoundError(f"Motion file {traj_path} not found.")
             
         assert len(all_trajectories) > 0, "No valid trajectories found in the dataset."
 
-        # concatenate trajectories
-        if len(all_trajectories) == 1:
-            trajectory = all_trajectories[0]
-        else:
-            traj_datas = [t.data for t in all_trajectories]
-            traj_infos = [t.info for t in all_trajectories]
-            traj_data, traj_info = TrajectoryData.concatenate(traj_datas, traj_infos, backend=jp)
-            trajectory = Trajectory(traj_info, traj_data)
+        trajectory = concatenate_prepared(all_trajectories, backend=jp)
 
         # load trajectory again to ensure the latest transformed trajectories is loaded
         self.th = self.load_trajectory(trajectory, warn=False)
 
         return trajectory.data
 
-    def preprocess_trajectory(self, dataset_dict: Dict[str, List[str]], batch_idx: int, num_batches: int, smooth_start_end: bool = True) -> Trajectory:
-        all_trajectories = []
-        num_trajectory = sum(len(traj_names) for traj_names in dataset_dict.values())
-
-        if num_batches > 1 and batch_idx is not None:
-            num_trajectories_per_batch = num_trajectory // num_batches
-            reminder = num_trajectory % num_batches
-
-            print(num_trajectory, batch_idx, num_batches, reminder)
-
-            if batch_idx < reminder:
-                start_idx = batch_idx * (num_trajectories_per_batch + 1)
-                end_idx = start_idx + num_trajectories_per_batch + 1
-            else:
-                start_idx = batch_idx * num_trajectories_per_batch + reminder
-                end_idx = start_idx + num_trajectories_per_batch
-
-            print("====================================================================================")
-            print(f"num_batches: {num_batches}, batch_idx: {batch_idx}, start_idx: {start_idx}, end_idx: {end_idx}")
-            print("====================================================================================")
-        else:
-            start_idx, end_idx = 0, num_trajectory
-
-        current_idx = 0
-
-        for dataset_name, traj_names in dataset_dict.items():
-            print(f"Loading dataset: {dataset_name} with {len(traj_names)} trajectories.")
-            dataset_dir = os.path.join(os.getcwd(), "storage", "data", "mocap", dataset_name)
-
-            for idx, t_name in enumerate(tqdm(traj_names)):
-                if current_idx >= end_idx:
-                    break
-
-                if current_idx >= start_idx:
-                    # load the npz file
-                    traj_path = os.path.join(dataset_dir, "UnitreeG1", f"{t_name}.npz")
-
-                    if os.path.exists(traj_path):
-                        traj = Trajectory.load(traj_path, backend=jp)
-
-                        if not traj.data.is_complete:
-                            print(f"Trajectory {t_name} is not complete. Extending...")
-                            traj = self.extend_motion(traj, smooth_start_end=smooth_start_end)
-                            traj.save(traj_path)  # save trajectory before recalculating velocity
-                        print(f"Loaded trajectory {t_name}")
-
-                        # recalculate velocity
-                        if self.recalculate_vel_in_reference_motion:
-                            traj = recalculate_traj_angular_velocity(traj, frequency=1.0 / self.dt, backend=jp)
-                            traj = recalculate_traj_linear_velocity(traj, frequency=1.0 / self.dt, backend=jp)
-                            traj = recalculate_traj_joint_velocity(traj, frequency=1.0 / self.dt, backend=jp)
-                        all_trajectories.append(traj)
-                    else:
-                        raise FileNotFoundError(f"Motion file {traj_path} not found.")
-
-                current_idx += 1
-
-            if current_idx >= end_idx:
-                break
-        
-        print(f"Batch {batch_idx} loaded {len(all_trajectories)} trajectories. Desired range: [{start_idx}, {end_idx}).")
-        assert len(all_trajectories) > 0, "No valid trajectories found in the dataset."
-
-        return None
+    def preprocess_trajectory(self, dataset_dict: Dict[str, List[str]], batch_idx: int,
+                              num_batches: int, smooth_start_end: bool = True,
+                              *, source_root, output_root, flat_source: bool = False, source_reference: str = None):
+        return preprocess_dataset(
+            self, dataset_dict, batch_idx, num_batches, smooth_start_end,
+            source_root=source_root, output_root=output_root, flat_source=flat_source,
+            source_reference=source_reference,
+        )
 
     def extend_motion(self, traj: Trajectory, smooth_start_end: bool = True) -> Trajectory:
         assert traj.data.n_trajectories == 1

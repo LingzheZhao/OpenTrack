@@ -191,8 +191,22 @@ class SmoothStartEndTransition:
         qpos_traj = transition_handler.result
         qpos_traj = return_backend.array(qpos_traj)
 
+        metadata = dict(self.traj.info.metadata or {})
+        transformations = list(metadata.get("opentrack_transformations", []))
+        transformations.append({
+            "operation": "SmoothStartEndTransition.run_interp",
+            "frequency": float(self.traj.info.frequency),
+            "prefix_frames": int(qpos_traj.shape[0] - self.traj.data.qpos.shape[0]),
+            "default_pose_sec": default_pose_sec,
+            "single_step_th": single_step_th,
+            "additional_transition_sec_start": additional_transition_sec_start,
+            "start_foot_id": start_foot_id, "start_foot_h": start_foot_h,
+            "start_com_off": start_com_off, "start_step_sec": start_step_sec,
+            "num_steps": num_steps,
+        })
+        metadata["opentrack_transformations"] = transformations
         ret_traj = Trajectory(
-            info = self.traj.info,
+            info = replace(self.traj.info, metadata=metadata),
             data = TrajectoryData(
                 qpos = qpos_traj,
                 qvel = return_backend.zeros((qpos_traj.shape[0], self.traj.data.qvel.shape[-1])),

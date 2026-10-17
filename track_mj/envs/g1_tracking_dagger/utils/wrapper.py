@@ -7,6 +7,7 @@ import mujoco.mjx as mjx
 from brax.envs.base import Env, State, Wrapper
 from mujoco_playground._src import mjx_env, wrapper
 from track_mj.utils.mjx_backend import MJX_WORLD_AXIS_NAME, mjx_impl
+from track_mj.envs.evaluation import owned_data
 
 
 def _is_warp_env(env: Env) -> bool:
@@ -98,6 +99,19 @@ class VmapWrapper(Wrapper):
         return jax.vmap(self.env._get_motor_targets, in_axes=(0, 0, None, None))(
             state, action, use_residual_action, trajectory_data
         )
+
+    def step_no_autoreset(self, state: State, action: jax.Array, trajectory_data=None) -> State:
+        """Vectorize the native terminal-preserving physical step."""
+        return jax.vmap(self.env.step_no_autoreset, in_axes=(0, 0, None), axis_name=MJX_WORLD_AXIS_NAME)(
+            state, action, trajectory_data
+        )
+
+    def physical_data(self, state: State):
+        """Fresh endpoint kinematics on copied data, without changing policy state."""
+        return jax.vmap(
+            lambda data: mjx.forward(self.env.mjx_model, data), axis_name=MJX_WORLD_AXIS_NAME
+        )(owned_data(state.data))
+
 
 
 class ModifiedEpisodeWrapper(Wrapper):
@@ -249,6 +263,23 @@ class ModifiedDomainRandomizationVmapWrapper(Wrapper):
         return jax.vmap(self.env._get_motor_targets, in_axes=(0, 0, None, None))(
             state, action, use_residual_action, trajectory_data
         )
+
+    def step_no_autoreset(self, state: State, action: jax.Array, trajectory_data=None) -> State:
+        def advance(model, current, submitted, trajectory):
+            return self._env_fn(model).step_no_autoreset(current, submitted, trajectory)
+        return jax.vmap(advance, in_axes=[self._in_axes, 0, 0, None], axis_name=MJX_WORLD_AXIS_NAME)(
+            self._mjx_model_v, state, action, trajectory_data
+        )
+
+    def _refresh_data(self, data):
+        return jax.vmap(
+            lambda model, world: mjx.forward(model, world),
+            in_axes=[self._in_axes, 0], axis_name=MJX_WORLD_AXIS_NAME,
+        )(self._mjx_model_v, data)
+
+    def physical_data(self, state: State):
+        return self._refresh_data(owned_data(state.data))
+
 
 
 class SampleClusterMotionWrapper(Wrapper):
