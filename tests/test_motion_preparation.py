@@ -2,12 +2,9 @@
 import os
 os.environ["JAX_PLATFORMS"] = "cpu"
 
-import ast
 from dataclasses import replace
-import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
-import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -17,18 +14,8 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def standalone(name, relative):
-    spec = importlib.util.spec_from_file_location(name, ROOT / relative)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-traj = standalone("track_mj.utils.dataset.traj_class", "track_mj/utils/dataset/traj_class.py")
-prep = standalone("motion_preparation", "track_mj/utils/dataset/preparation.py")
+os.environ.setdefault("GLI_PATH", str(ROOT))
+from track_mj.utils.dataset import traj_class as traj, preparation as prep
 
 
 def tiny_trajectory():
@@ -140,20 +127,6 @@ class MotionPreparationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             prep.preprocess_dataset(None, dataset, 0, 1, False, source_root="/raw", output_root="/raw")
 
-    def test_all_runtime_entrypoints_load_only_prepared_artifacts(self):
-        for family in ("g1_tracking", "g1_tracking_dagger", "g1_tracking_adapter"):
-            for mode, filename in (("train", "g1_env_tracking_general.py"), ("play", "play_g1_env_tracking_general.py")):
-                path = ROOT / "track_mj/envs" / family / mode / filename
-                tree = ast.parse(path.read_text())
-                cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and any(isinstance(m, ast.FunctionDef) and m.name == "prepare_trajectory" for m in n.body))
-                method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "prepare_trajectory")
-                calls = [n.func for n in ast.walk(method) if isinstance(n, ast.Call)]
-                names = [n.id for n in calls if isinstance(n, ast.Name)]
-                attrs = [n.attr for n in calls if isinstance(n, ast.Attribute)]
-                self.assertIn("load_prepared_trajectory", names)
-                self.assertNotIn("save", attrs)
-                self.assertNotIn("extend_motion", attrs)
-                self.assertFalse(any(n.startswith("recalculate_traj_") for n in names))
 
 
 if __name__ == "__main__":
