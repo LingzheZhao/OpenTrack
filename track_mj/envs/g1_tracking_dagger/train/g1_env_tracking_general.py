@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Union, Tuple, List, Callable
+from typing import Any, Dict, Optional, Union, Tuple, List, Callable, NamedTuple
 from ml_collections import config_dict
 from dataclasses import replace
 import os
@@ -187,7 +187,60 @@ def g1_tracking_general_task_config() -> config_dict.ConfigDict:
 tmj.registry.register("G1TrackingGeneral", "tracking_dagger_config")(g1_tracking_general_task_config())
 
 
-def torque_step(
+class ContactSamples(NamedTuple):
+    """Solved JAX Euler contacts for each integration interval, in native body order.
+
+    A control action stacks these leaves on its physics-substep axis. Forces
+    belong to the solve at interval_start_s; interval_end_s is the advanced
+    integration time. No endpoint forward is performed. Vectors are world-frame
+    newtons. A constraint slot can be present while its solved force is zero.
+    """
+    interval_start_s: jax.Array
+    interval_end_s: jax.Array
+    total_force_world_by_body_n: jax.Array
+    normal_force_world_by_body_n: jax.Array
+    geom: jax.Array
+    constraint_present: jax.Array
+    normal_n: jax.Array
+    total_force_world_n: jax.Array
+
+
+def _require_contact_backend(model, data):
+    if model.impl != mjx.Impl.JAX or data.impl != mjx.Impl.JAX:
+        raise NotImplementedError("Solved substep contact measurement requires the JAX backend; Warp is unavailable.")
+    if model.opt.integrator != mjx.IntegratorType.EULER:
+        raise NotImplementedError("Solved substep contact timing is defined only for the native Euler integrator.")
+
+
+def _solved_contact_sample(model, data, interval_start):
+    from mujoco.mjx._src import support
+
+    contact = data._impl.contact
+    # Contact dimension and constraint addresses are static in native DataJAX.
+    # Skip excluded slots rather than indexing a negative constraint address.
+    forces = [support.contact_force(model, data, index, to_world_frame=False)
+              if address >= 0 else jp.zeros((6,), dtype=data.qvel.dtype)
+              for index, address in enumerate(contact.efc_address)]
+    forces = jp.stack(forces) if forces else jp.zeros((0, 6), dtype=data.qvel.dtype)
+    geom = contact.geom
+    present = (jp.asarray(contact.efc_address) >= 0) & jp.all(geom >= 0, axis=-1)
+    world_force = jax.vmap(lambda force, frame: force[:3] @ frame)(forces, contact.frame)
+    total = jp.where(present[:, None], world_force, 0.)
+    normal_n = jp.where(present, forces[:, 0], 0.)
+    normal = jp.where(present[:, None], normal_n[:, None] * contact.frame[:, 0, :], 0.)
+    bodies = jp.asarray(model.geom_bodyid)[jp.maximum(geom, 0)]
+
+    def body_sum(values):
+        # Solver force points from geom0 to geom1: equal and opposite forces.
+        result = jp.zeros((model.nbody, 3), dtype=values.dtype)
+        result = result.at[bodies[:, 0]].add(-values)
+        return result.at[bodies[:, 1]].add(values)
+
+    return ContactSamples(interval_start, data.time, body_sum(total), body_sum(normal),
+                          geom, present, normal_n, total)
+
+
+def _torque_step(
     rng: jax.Array,
     model: mjx.Model,
     data: mjx.Data,
@@ -196,7 +249,11 @@ def torque_step(
     kds: jax.Array,
     torque_limit: jax.Array,
     n_substeps: int = 1,
-) -> tuple[jax.Array, mjx.Data, jax.Array]:
+    *, capture_contacts: bool = False,
+) -> tuple[jax.Array, mjx.Data, jax.Array, ContactSamples | None]:
+    if capture_contacts:
+        _require_contact_backend(model, data)
+
     def single_step(carry, _):
         rng, data, _ = carry
         rng, rng_rfi = jax.random.split(rng, 2)
@@ -211,14 +268,30 @@ def torque_step(
 
         # apply torque
         data = data.replace(ctrl=torque)
+        interval_start = data.time if capture_contacts else None
         data = mjx.step(model, data)
+        samples = _solved_contact_sample(model, data, interval_start) if capture_contacts else None
 
-        return (rng, data, torque), None
+        return (rng, data, torque), samples
 
     initial_torque = jp.zeros_like(torque_limit)
-    (final_rng, final_data, final_torque), _ = jax.lax.scan(single_step, (rng, data, initial_torque), (), n_substeps)
+    (final_rng, final_data, final_torque), samples = jax.lax.scan(single_step, (rng, data, initial_torque), (), n_substeps)
 
-    return final_rng, final_data, final_torque
+    return final_rng, final_data, final_torque, samples
+
+
+
+def torque_step(rng, model, data, qpos_des, kps, kds, torque_limit, n_substeps=1):
+    """Native PD physics and key sequence, without contact recording."""
+    rng, data, torque, _ = _torque_step(rng, model, data, qpos_des, kps, kds,
+                                       torque_limit, n_substeps)
+    return rng, data, torque
+
+
+def torque_step_with_contacts(rng, model, data, qpos_des, kps, kds, torque_limit, n_substeps=1):
+    """The same physics loop, returning actual solved contact samples too."""
+    return _torque_step(rng, model, data, qpos_des, kps, kds, torque_limit,
+                        n_substeps, capture_contacts=True)
 
 
 def get_collision_contact(contact: Any, geom1: int, geom2: int) -> Tuple[jax.Array, jax.Array]:
@@ -471,8 +544,19 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         """The same physical advance and observations, retaining the terminal state."""
         return self._step(state, action, trajectory_data, auto_reset=False)
 
+    def step_with_contacts(self, state: mjx_env.State, action: jax.Array,
+                           trajectory_data: TrajectoryData = None):
+        """Advance without autoreset; return terminal state and 500 Hz solved forces.
+
+        This explicit measurement path supports native JAX Euler only. Body
+        indices follow mj_model.body order; no foot or illegal-contact rule is
+        implied. Instrumented numerical neutrality needs native validation.
+        """
+        _require_contact_backend(self.mjx_model, state.data)
+        return self._step(state, action, trajectory_data, auto_reset=False, capture_contacts=True)
+
     def _step(self, state: mjx_env.State, action: jax.Array, trajectory_data: TrajectoryData,
-              *, auto_reset: bool) -> mjx_env.State:
+              *, auto_reset: bool, capture_contacts: bool = False):
         if not auto_reset:
             state = copy_state_containers(state)
         if trajectory_data is None:
@@ -483,16 +567,28 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         traj_data = self.th.get_current_traj_data_with_trajectory(trajectory_data, state.info["traj_info"])
         motor_targets = self._get_motor_targets(state, action, use_residual_action=self._config.student_use_residual_action, trajectory_data=trajectory_data)
 
-        state.info["rng"], data, torque = torque_step(
-            state.info["rng"],
-            self.mjx_model,
-            state.data,
-            motor_targets,
-            kps=self._kps,
-            kds=self._kds,
-            torque_limit=self.torque_limit,
-            n_substeps=self.n_substeps,
-        )
+        if capture_contacts:
+            state.info["rng"], data, torque, samples = torque_step_with_contacts(
+                state.info["rng"],
+                self.mjx_model,
+                state.data,
+                motor_targets,
+                kps=self._kps,
+                kds=self._kds,
+                torque_limit=self.torque_limit,
+                n_substeps=self.n_substeps,
+            )
+        else:
+            state.info["rng"], data, torque = torque_step(
+                state.info["rng"],
+                self.mjx_model,
+                state.data,
+                motor_targets,
+                kps=self._kps,
+                kds=self._kds,
+                torque_limit=self.torque_limit,
+                n_substeps=self.n_substeps,
+            )
         rewards = self._get_reward(data, traj_data, action, motor_targets, torque, state.info)
         rewards = {k: v * rewards[k] for k, v in self._config.reward_config.scales.items()}
         reward = jp.clip(sum(rewards.values()) * self.dt, a_max=10000.0)
@@ -540,7 +636,7 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
 
         state = state.replace(data=data, obs=obs, reward=reward, done=done)
         if not auto_reset:
-            return state
+            return (state, samples) if capture_contacts else state
         # Warp cannot call mjx.forward from this per-env reset branch once vmapped;
         # the DAgger wrapper resets done worlds after the vmap instead.
         if mjx_impl(self._config) == "warp" and "worldid" in state.info:
