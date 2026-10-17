@@ -58,6 +58,11 @@ def array_difference(left, right):
             "max_abs": float(np.max(delta)) if delta.size and np.isfinite(delta).all() else (0. if not delta.size else None)}
 
 
+def nonfinite_counts(arrays):
+    return {name: int(np.count_nonzero(~np.isfinite(value))) for name, value in arrays.items()
+            if np.asarray(value).dtype.kind in "fc" and not np.isfinite(value).all()}
+
+
 def compare(left, right):
     same = left.structure == right.structure and left.avals == right.avals
     differences = {}
@@ -67,6 +72,7 @@ def compare(left, right):
         if not difference.get("exact_equal", False):
             differences[name] = difference
     return {"same_tree_and_avals": bool(same), "different_leaves": differences,
+            "nonfinite_left": nonfinite_counts(left.arrays), "nonfinite_right": nonfinite_counts(right.arrays),
             "physical": {name: array_difference(left.physical[name], right.physical[name])
                          for name in left.physical.keys() & right.physical.keys()}}
 
@@ -116,7 +122,8 @@ def write_json(path, value):
 def save_capture(root, name, value):
     with (root / (name + ".npz")).open("xb") as stream:
         np.savez(stream, **value.arrays)
-    write_json(root / (name + ".json"), {"avals": value.avals, "tree_description": str(value.structure)})
+    write_json(root / (name + ".json"), {"avals": value.avals, "tree_description": str(value.structure),
+                                                       "nonfinite_leaves": nonfinite_counts(value.arrays)})
 
 
 def run(args, report):

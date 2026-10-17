@@ -33,6 +33,16 @@ class ContactReportTests(unittest.TestCase):
         after.avals["all_state_leaf"]["weak_type"] = True
         self.assertFalse(compare(before, after)["same_tree_and_avals"])
 
+    def test_equal_nonfinite_cache_values_are_reported_outside_physical_quantities(self):
+        left, right = saved(1), saved(1)
+        left.arrays["native_cache"] = np.asarray([np.inf])
+        right.arrays["native_cache"] = np.asarray([np.inf])
+        with np.errstate(invalid="ignore"):
+            result = compare(left, right)
+        self.assertEqual(result["different_leaves"], {})
+        self.assertEqual(result["nonfinite_left"], {"native_cache": 1})
+        self.assertEqual(result["nonfinite_right"], {"native_cache": 1})
+
     def test_positive_force_requires_a_present_solved_slot_not_geometry_alone(self):
         samples = {"constraint_present": np.asarray([[[True, True, False], [True, True, False]]]),
                    "normal_n": np.asarray([[[0., 2., 900.], [0., 0., 900.]]]),
