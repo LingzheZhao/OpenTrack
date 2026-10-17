@@ -1,5 +1,12 @@
 """CPU-only checks of descriptive report arithmetic; no native environment."""
 import unittest
+from unittest.mock import patch
+import json
+from pathlib import Path
+import signal
+import tempfile
+
+import native_contact_comparison as diagnostic
 
 import numpy as np
 
@@ -42,6 +49,24 @@ class ContactReportTests(unittest.TestCase):
         self.assertEqual(result["different_leaves"], {})
         self.assertEqual(result["nonfinite_left"], {"native_cache": 1})
         self.assertEqual(result["nonfinite_right"], {"native_cache": 1})
+
+    def test_external_interrupts_write_a_report_and_remain_interrupts(self):
+        for number in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=number), tempfile.TemporaryDirectory() as scratch:
+                output = Path(scratch) / "out"
+                argv = ["native_contact_comparison.py", "--config", "unused", "--motion", "unused",
+                        "--out", str(output), "--source-reference", "example-source",
+                        "--motion-reference", "example-motion"]
+                original = signal.getsignal(number)
+                with patch("sys.argv", argv), patch.object(diagnostic, "run", side_effect=lambda *_: signal.raise_signal(number)):
+                    with self.assertRaisesRegex(InterruptedError, signal.Signals(number).name):
+                        diagnostic.main()
+                report = json.loads((output / "report.json").read_text())
+                self.assertEqual(report["status"], "interrupted")
+                self.assertEqual(report["error_type"], "InterruptedError")
+                self.assertEqual(report["physical_calls"], [])
+                self.assertIn("finished_at", report)
+                self.assertEqual(signal.getsignal(number), original)
 
     def test_positive_force_requires_a_present_solved_slot_not_geometry_alone(self):
         samples = {"constraint_present": np.asarray([[[True, True, False], [True, True, False]]]),

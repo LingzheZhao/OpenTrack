@@ -190,13 +190,17 @@ def run(args, report):
         for control in range(1, args.warmup_controls + 1):
             state = advance("warmup_plain", plain_step, clone(state))
             jax.block_until_ready(state)
+            save_capture(args.out, f"warmup-plain-{control}", capture(state, jax, state=True))
             if bool(np.any(jax.device_get(state.done))):
                 report["status"] = "warmup_terminated_before_comparison"
                 return
             candidate = clone(state)
             probe_state, samples = advance("warmup_contact_probe", contact_step, candidate)
             jax.block_until_ready((probe_state, samples))
+            save_capture(args.out, f"warmup-probe-{control}", capture(probe_state, jax, state=True))
             measured = {name: np.array(jax.device_get(value), copy=True) for name, value in samples._asdict().items()}
+            with (args.out / f"warmup-contacts-{control}.npz").open("xb") as stream:
+                np.savez(stream, **measured)
             reading = contact_summary(measured, env._floor_geom_id)
             report["warmup"].append({"plain_controls": control, "probe": reading})
             print(f"warmup {control}: positive normal slots {reading['positive_normal_slots']}", flush=True)
@@ -216,19 +220,20 @@ def run(args, report):
                 before = capture(owned, jax, state=True)
                 if compare(fixed_capture, before)["different_leaves"] or not compare(fixed_capture, before)["same_tree_and_avals"]:
                     raise ValueError("owned native input differs from the fixed complete input")
+                samples = None
                 if mode == "plain":
                     output = advance("comparison_plain", plain_step, owned)
                 else:
                     output, samples = advance("comparison_instrumented", contact_step, owned)
-                    jax.block_until_ready((output, samples))
+                # Retain the completed physical output before optional contact validation can fail.
+                immediate = capture(output, jax, state=True)
+                save_capture(args.out, f"{mode}-{repeat}-step-0", immediate)
+                by_mode[mode][0].append(immediate)
+                if samples is not None:
                     measured = {name: np.array(jax.device_get(value), copy=True) for name, value in samples._asdict().items()}
                     with (args.out / f"contacts-{repeat}.npz").open("xb") as stream:
                         np.savez(stream, **measured)
                     report["contact_repeats"].append(contact_summary(measured, env._floor_geom_id))
-                jax.block_until_ready(output)
-                immediate = capture(output, jax, state=True)
-                save_capture(args.out, f"{mode}-{repeat}-step-0", immediate)
-                by_mode[mode][0].append(immediate)
                 unchanged = compare(before, capture(owned, jax, state=True))
                 report["input_checks"].append(unchanged)
                 if unchanged["different_leaves"] or not unchanged["same_tree_and_avals"]:
@@ -272,15 +277,23 @@ def main():
               "scope": "Full owned native State; fixed model, trajectory, action and static tree. All deltas are descriptive; no tolerance pass, numerical-neutrality, or full-clip claim."}
     def expired(signum, frame):
         raise TimeoutError("manual contact diagnostic wall budget exhausted")
-    signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, args.wall_seconds)
+    def interrupted(signum, frame):
+        raise InterruptedError(f"manual contact diagnostic interrupted by {signal.Signals(signum).name}")
+    previous = {number: signal.getsignal(number) for number in (signal.SIGALRM, signal.SIGTERM, signal.SIGINT)}
     try:
+        signal.signal(signal.SIGALRM, expired)
+        signal.signal(signal.SIGTERM, interrupted)
+        signal.signal(signal.SIGINT, interrupted)
+        signal.setitimer(signal.ITIMER_REAL, args.wall_seconds)
         run(args, report)
-    except Exception:
-        report.update(status="failed", error=traceback.format_exc())
+    except Exception as error:
+        report.update(status="interrupted" if isinstance(error, InterruptedError) else "failed",
+                      error_type=type(error).__name__, error=traceback.format_exc())
         raise
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
+        for number, handler in previous.items():
+            signal.signal(number, handler)
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
         write_json(args.out / "report.json", report)
 
