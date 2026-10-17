@@ -223,6 +223,29 @@ numerical reproducibility needs separate qualification; CPU tests use fake physi
 and do not establish native engine equivalence. Reset isolation corrections are
 outside this interface.
 
+The DAgger training environment additionally exposes opt-in
+`step_with_contacts(state, action, trajectory_data)`, returning `(terminal_state,
+ContactSamples)` without resetting. It supports JAX with the native Euler
+integrator; requesting Warp or another integrator raises explicitly. The regular
+training step does not collect these samples. To vectorize this method, use the
+same native world axis as `VmapWrapper`.
+
+Each physics interval supplies solved normal and total contact forces in world
+newtons, reduced by native MuJoCo body index: negative on the first contact geom's
+body and positive on the second. The world body is included. Forces are summed as
+vectors before any magnitude is taken. Per-contact geom indices, allocated
+constraint mask, normal force and total world force remain available. An allocated
+constraint slot with zero force is not evidence of loaded contact. Foot and
+illegal-contact rules require an explicit body mapping and protocol.
+
+`interval_start_s` and `interval_end_s` come from native integration time. With
+the default 0.002 s physics step, ten samples cover each 0.02 s action (500 Hz).
+For Euler, the force belongs to the solve at the interval's starting pose, while
+the returned position has advanced to its end. No extra forward or integration is
+performed. Recording changes the compiled output graph; CPU fake-physics checks
+do not establish numerical neutrality. Compare instrumented native runs against
+uninstrumented native repeats before using the forces in a result.
+
 ### Evaluate the specialist teachers
 
   ```shell
