@@ -7,7 +7,7 @@ import mujoco.mjx as mjx
 from brax.envs.base import Env, State, Wrapper
 from mujoco_playground._src import mjx_env, wrapper
 from track_mj.utils.mjx_backend import MJX_WORLD_AXIS_NAME, mjx_impl
-from track_mj.envs.evaluation import owned_data
+from track_mj.envs.evaluation import owned_data, reset_done_envs as _reset_done_envs
 
 
 def _is_warp_env(env: Env) -> bool:
@@ -15,46 +15,10 @@ def _is_warp_env(env: Env) -> bool:
     return mjx_impl(config) == "warp"
 
 
-def _where_done(done: jax.Array, reset_value, value):
-    if not hasattr(value, "shape"):
-        return reset_value
-    if value.shape[: done.ndim] == done.shape:
-        mask = done.reshape(done.shape + (1,) * (value.ndim - done.ndim))
-        return jp.where(mask, reset_value, value)
-    return jp.where(jp.any(done), reset_value, value)
-
-
 def _annotate_worldid(state: State) -> State:
     info = dict(state.info)
     info["worldid"] = jp.arange(state.done.shape[0], dtype=jp.int32)
     return state.replace(info=info)
-
-
-def _reset_done_envs(
-    current_state: State,
-    reset_fn: Callable[[jax.Array], State],
-    refresh_data_fn: Callable[[mjx.Data], mjx.Data],
-) -> State:
-    split_rng = jax.vmap(lambda rng: jax.random.split(rng, 2))(current_state.info["rng"])
-    reset_rng = split_rng[:, 0]
-    next_rng = split_rng[:, 1]
-    current_info = dict(current_state.info)
-    current_info["rng"] = next_rng
-    current_state = current_state.replace(info=current_info)
-
-    reset_state = reset_fn(reset_rng)
-    done = current_state.done.astype(bool)
-    data = jax.tree_util.tree_map(lambda r, v: _where_done(done, r, v), reset_state.data, current_state.data)
-    data = refresh_data_fn(data)
-    obs = jax.tree_util.tree_map(lambda r, v: _where_done(done, r, v), reset_state.obs, current_state.obs)
-    info = dict(current_state.info)
-    for key, reset_value in reset_state.info.items():
-        info[key] = jax.tree_util.tree_map(
-            lambda r, v: _where_done(done, r, v),
-            reset_value,
-            current_state.info[key],
-        )
-    return current_state.replace(data=data, obs=obs, info=info)
 
 
 class VmapWrapper(Wrapper):
@@ -111,6 +75,18 @@ class VmapWrapper(Wrapper):
         return jax.vmap(
             lambda data: mjx.forward(self.env.mjx_model, data), axis_name=MJX_WORLD_AXIS_NAME
         )(owned_data(state.data))
+
+    def reset_done(self, state: State, trajectory_data=None) -> State:
+        return jax.lax.cond(
+            jp.any(state.done.astype(bool)),
+            lambda current: _reset_done_envs(
+                current, lambda rng: self.reset(rng, trajectory_data),
+                lambda data: jax.vmap(
+                    lambda world: mjx.forward(self.env.mjx_model, world), axis_name=MJX_WORLD_AXIS_NAME
+                )(data),
+            ),
+            lambda current: current, state,
+        )
 
 
 
@@ -279,6 +255,15 @@ class ModifiedDomainRandomizationVmapWrapper(Wrapper):
 
     def physical_data(self, state: State):
         return self._refresh_data(owned_data(state.data))
+
+    def reset_done(self, state: State, trajectory_data=None) -> State:
+        return jax.lax.cond(
+            jp.any(state.done.astype(bool)),
+            lambda current: _reset_done_envs(
+                current, lambda rng: self.reset(rng, trajectory_data), self._refresh_data,
+            ),
+            lambda current: current, state,
+        )
 
 
 

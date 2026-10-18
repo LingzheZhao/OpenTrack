@@ -69,6 +69,20 @@ def assert_tree_equal(test, left, right):
         np.testing.assert_array_equal(a, b)
 
 
+def batch_state(keys):
+    n = len(keys)
+    return State({"qpos": jp.arange(n, dtype=float)[:, None]}, {"policy": jp.zeros((n, 2))},
+                 jp.arange(n, dtype=float), jp.zeros(n), {"terminal": jp.arange(n, dtype=float)},
+                 {"rng": keys, "last_motor_targets": jp.zeros((n, 2))})
+
+
+def reset_batch(keys):
+    keys = jax.vmap(lambda key: jax.random.split(key)[1])(keys)
+    state = batch_state(keys)
+    return state.replace(data={"qpos": jp.full_like(state.data["qpos"], -10)},
+                         obs={"policy": jp.full_like(state.obs["policy"], -20)})
+
+
 def fake_native(family, residual, terminate, dr=False):
     module = NATIVE_DR[family] if dr else NATIVE[family]
     cls = module.G1TrackingGeneralDREnv if dr else module.G1TrackingGeneralEnv
@@ -179,6 +193,119 @@ class EvaluationBoundaryTests(unittest.TestCase):
         owned = evaluation.owned_data(source)
         np.testing.assert_array_equal(owned["qpos"], source["qpos"])
         self.assertNotEqual(owned["qpos"].unsafe_buffer_pointer(), source["qpos"].unsafe_buffer_pointer())
+        self.assertFalse(evaluation.contact_measurement()["available"])
+
+
+    def test_shared_warp_contact_capacity_equal_to_world_count_is_not_world_axis(self):
+        # MuJoCo 3.9 DATA_NON_VMAP declares both contact fields shared, even
+        # when naconmax happens to equal num_envs. Constraint rows are per world.
+        shared = {"contact__worldid", "contact__geom"}
+        data = {"qpos": jp.array([[1.], [2.]]), "xpos": jp.array([[10.], [20.]]),
+                "_impl": {"contact__worldid": jp.array([0, 1]),
+                          "contact__geom": jp.array([[1, 2], [3, 4]]),
+                          "efc__id": jp.array([[5, 6], [7, 8]])}}
+        reset_data = {"qpos": jp.array([[-1.], [-2.]]), "xpos": jp.array([[-10.], [-20.]]),
+                      "_impl": {"contact__worldid": jp.array([1, 0]),
+                                "contact__geom": jp.array([[9, 10], [11, 12]]),
+                                "efc__id": jp.array([[13, 14], [15, 16]])}}
+        done = jp.array([False, True])
+        merged = evaluation.merge_world_data(done, reset_data, data, non_vmap_fields=shared)
+        np.testing.assert_array_equal(merged["qpos"], [[1], [-2]])
+        np.testing.assert_array_equal(merged["_impl"]["contact__geom"], reset_data["_impl"]["contact__geom"])
+        np.testing.assert_array_equal(merged["_impl"]["contact__worldid"], [1, 0])
+
+        initial = batch_state(jax.random.split(jax.random.PRNGKey(5), 2)).replace(data=data, done=done)
+        def reset(keys):
+            return reset_batch(keys).replace(data=reset_data)
+        def refresh(value):
+            # Stand-in for a coherent native forward: every derived cache and
+            # shared contact order is rebuilt together from the merged state.
+            return {"qpos": value["qpos"], "xpos": value["qpos"] + 100,
+                    "_impl": {"contact__worldid": jp.array([1, 0]),
+                              "contact__geom": jp.array([[30, 31], [32, 33]]),
+                              "efc__id": jp.array([[40, 41], [42, 43]])}}
+        with patch.object(evaluation, "_native_non_vmap_fields", return_value=shared):
+            actual = evaluation.reset_done_envs(initial, reset, refresh)
+        np.testing.assert_array_equal(actual.data["qpos"][0], initial.data["qpos"][0])
+        np.testing.assert_array_equal(actual.info["rng"][0], initial.info["rng"][0])
+        np.testing.assert_array_equal(actual.data["xpos"], [[101], [98]])
+        np.testing.assert_array_equal(actual.data["_impl"]["efc__id"], [[40, 41], [42, 43]])
+        np.testing.assert_array_equal(actual.data["_impl"]["contact__geom"], [[30, 31], [32, 33]])
+
+
+    def test_unknown_native_world_layout_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "lacks expected world prefix"):
+            evaluation.merge_world_data(jp.array([False, True]), {"qpos": jp.zeros((3, 1))},
+                                        {"qpos": jp.zeros((3, 1))})
+
+
+    def test_peer_reset_preserves_ongoing_rng_and_persistent_state(self):
+        state = batch_state(jax.random.split(jax.random.PRNGKey(8), 3))
+        state = state.replace(done=jp.array([False, True, False]))
+        reset = jax.jit(lambda s: evaluation.reset_done_envs(
+            s, reset_batch, lambda data: {"qpos": data["qpos"] + 100}))(state)
+        for world in (0, 2):
+            np.testing.assert_array_equal(reset.info["rng"][world], state.info["rng"][world])
+            np.testing.assert_array_equal(reset.data["qpos"][world], state.data["qpos"][world])
+            np.testing.assert_array_equal(reset.obs["policy"][world], state.obs["policy"][world])
+        reset_key = jax.random.split(state.info["rng"][1])[0]
+        expected = jax.random.split(reset_key)[1]
+        np.testing.assert_array_equal(reset.info["rng"][1], expected)
+        assert_tree_equal(self, reset.metrics, state.metrics)
+        np.testing.assert_array_equal(reset.done, state.done)
+        np.testing.assert_array_equal(reset.reward, state.reward)
+
+
+    def test_ongoing_random_draw_sequence_matches_isolated_world(self):
+        keys = jax.random.split(jax.random.PRNGKey(99), 2)
+        state, isolated = batch_state(keys), keys[0]
+        for step in range(10):
+            draws = jax.vmap(lambda key: jax.random.split(key, 2))(state.info["rng"])
+            isolated, draw_key = jax.random.split(isolated)
+            np.testing.assert_array_equal(jax.random.normal(draws[0, 1], (3,)), jax.random.normal(draw_key, (3,)))
+            state = state.replace(info={**state.info, "rng": draws[:, 0]}, done=jp.array([False, step % 2 == 0]))
+            state = evaluation.reset_done_envs(state, reset_batch, lambda data: data)
+            np.testing.assert_array_equal(state.info["rng"][0], isolated)
+
+
+    def test_actual_vector_wrappers_preserve_terminal_and_ongoing_world(self):
+        for family in ("g1_tracking", "g1_tracking_dagger"):
+            env, _, _ = fake_native(family, False, False)
+            env._get_termination = lambda data, reference, info: data.qpos[7] > .5
+            vector = WRAPPERS[family].VmapWrapper(env)
+            keys = jax.random.split(jax.random.PRNGKey(5), 2)
+            pre = vector.reset(keys, object())
+            actions = jp.zeros((2, 29)).at[1, 0].set(1)
+            transition = evaluation.evaluate_step(vector, pre, actions, object())
+            np.testing.assert_array_equal(transition.reset_mask, [False, True])
+            np.testing.assert_array_equal(transition.post_terminal.info["last_motor_targets"][1, 0], 2)
+            np.testing.assert_array_equal(transition.next_state.info["last_motor_targets"][1, 0], 0)
+            np.testing.assert_array_equal(transition.post_physical_data.xpos, jp.full((2, 1, 3), 10))
+            np.testing.assert_array_equal(transition.post_terminal.data.xpos, jp.zeros((2, 1, 3)))
+            np.testing.assert_array_equal(transition.next_state.data.xpos[0], transition.post_terminal.data.xpos[0] + 10)
+            np.testing.assert_array_equal(transition.next_state.data.qpos[0], transition.post_terminal.data.qpos[0])
+            np.testing.assert_array_equal(transition.next_state.info["rng"][0], transition.post_terminal.info["rng"][0])
+
+
+    def test_measurement_copy_and_reset_keep_terminal_snapshot(self):
+        initial = batch_state(jax.random.split(jax.random.PRNGKey(3), 2))
+        class Env:
+            def step_no_autoreset(self, state, action, trajectory):
+                state = evaluation.copy_state_containers(state)
+                state.info["last_motor_targets"] = action
+                return state.replace(data={"qpos": state.data["qpos"] + 1}, done=jp.array([False, True]))
+            def physical_data(self, state):
+                copied = evaluation.owned_data(state.data)
+                return {"qpos": copied["qpos"] + 2}
+            def reset_done(self, state, trajectory):
+                return evaluation.reset_done_envs(state, reset_batch, lambda data: data)
+        transition = evaluation.evaluate_step(Env(), initial, jp.ones((2, 2)))
+        np.testing.assert_array_equal(transition.pre.info["last_motor_targets"], jp.zeros((2, 2)))
+        np.testing.assert_array_equal(transition.post_terminal.data["qpos"], [[1], [2]])
+        np.testing.assert_array_equal(transition.post_physical_data["qpos"], [[3], [4]])
+        np.testing.assert_array_equal(transition.next_state.data["qpos"], [[1], [-10]])
+        copied = evaluation.owned_data(initial.data)
+        self.assertNotEqual(copied["qpos"].unsafe_buffer_pointer(), initial.data["qpos"].unsafe_buffer_pointer())
         self.assertFalse(evaluation.contact_measurement()["available"])
 
 

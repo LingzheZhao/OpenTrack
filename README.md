@@ -223,15 +223,32 @@ can use `step_no_autoreset(state, action, trajectory_data)`. Their matching
 `VmapWrapper` and domain-randomization vector wrapper expose this method and
 `physical_data(state)`. Use the vector wrapper directly so action repetition
 cannot hide a terminal boundary. Evaluation retains the true terminal state and
-copies the input info and metrics containers before advancing. Training `step`
-keeps its native automatic-reset policy and RNG behavior.
+copies the input info and metrics containers before advancing. Training `step` retains its native automatic-reset policy; the draft vector reset
+correction below changes RNG and data handling when a peer resets.
 
 `physical_data` runs native forward on owned endpoint data. Its refreshed
 kinematics do not replace policy observations or continuation data. The interface
 declares measured substep contact forces unavailable. Native subsequent-step
 numerical reproducibility needs separate qualification; CPU tests use fake physics
-and do not establish native engine equivalence. Reset isolation corrections are
-outside this interface.
+and do not establish native engine equivalence. The draft reset-isolation extension adds `reset_done(state, trajectory_data)` to
+both vector wrappers. `track_mj.envs.evaluation.evaluate_step` returns the input,
+native terminal, owned physical endpoint, continuation/reset state and reset mask
+separately.
+
+This extension intentionally changes vector training reset semantics. A done
+world no longer advances an ongoing world's RNG key. Persistent integration and
+control fields, including solver warm start, remain unchanged for ongoing worlds.
+MuJoCo 3.9's `DATA_NON_VMAP` identifies shared Warp contact and work arrays;
+capacity is not interpreted as a world axis. Native forward rebuilds derived
+per-world caches and shared buffers together, so those derived caches can change
+when a peer resets. Reset worlds retain native forward corrections, including JAX
+root-quaternion renormalization.
+
+Reset-boundary checks do not establish subsequent-step equivalence. Native JAX
+next-step differences remain unresolved, including a zero-mask comparison; this
+draft is not qualified for training continuation. Compare reset payloads with the
+native post-forward state and assess later body dynamics separately. CPU tests
+exercise boundary semantics with fake physics.
 
 The DAgger training environment additionally exposes opt-in
 `step_with_contacts(state, action, trajectory_data)`, returning `(terminal_state,
