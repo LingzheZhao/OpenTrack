@@ -2,13 +2,13 @@
 import os
 os.environ["JAX_PLATFORMS"] = "cpu"
 
-import ast
-from functools import partial
-import importlib.util
+from contextlib import ExitStack
+from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NamedTuple
 import unittest
+from unittest.mock import patch
 
 import jax
 import jax.numpy as jp
@@ -16,9 +16,21 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("native_evaluation", ROOT / "track_mj/envs/evaluation.py")
-evaluation = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(evaluation)
+os.environ.setdefault("GLI_PATH", str(ROOT))
+from track_mj.envs import evaluation
+
+NATIVE = {family: import_module(f"track_mj.envs.{family}.train.g1_env_tracking_general")
+          for family in ("g1_tracking", "g1_tracking_dagger")}
+NATIVE_DR = {family: import_module(f"track_mj.envs.{family}.train.g1_env_tracking_general_dr")
+             for family in NATIVE}
+WRAPPERS = {family: import_module(f"track_mj.envs.{family}.utils.wrapper") for family in NATIVE}
+
+
+def physics(rng, model, data, targets, **kwargs):
+    """Keep native key cadence, substituting only physical integration."""
+    for _ in range(kwargs["n_substeps"]):
+        rng, _ = jax.random.split(rng)
+    return rng, data.replace(qpos=data.qpos.at[7:].set(targets)), jp.zeros_like(targets)
 
 
 class State(NamedTuple):
@@ -57,50 +69,20 @@ def assert_tree_equal(test, left, right):
         np.testing.assert_array_equal(a, b)
 
 
-def native_methods(family, dr=False):
-    """Execute the actual production step methods with a tiny fake physics port.
-
-    Loading just these AST nodes avoids importing native MuJoCo and the package's
-    eager environment registry. The motor-target/history/RNG code is unmodified.
-    """
-    path = ROOT / "track_mj/envs" / family / "train/g1_env_tracking_general.py"
-    tree = ast.parse(path.read_text())
-    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "G1TrackingGeneralEnv")
-    wanted = {"step", "step_no_autoreset", "_step", "_reset_and_update_state", "_get_motor_targets"}
-    methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
-    if dr:
-        dr_path = path.with_name("g1_env_tracking_general_dr.py")
-        dr_cls = next(node for node in ast.parse(dr_path.read_text()).body
-                      if isinstance(node, ast.ClassDef) and node.name == "G1TrackingGeneralDREnv")
-        methods.extend(node for node in dr_cls.body if isinstance(node, ast.FunctionDef) and node.name in wanted)
-    module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
-                              *methods], type_ignores=[])
-    ast.fix_missing_locations(module)
-
-    def physics(rng, model, data, targets, **kwargs):
-        # Same native per-substep key split, without any physical integration.
-        for _ in range(kwargs["n_substeps"]):
-            rng, _ = jax.random.split(rng)
-        return rng, data.replace(qpos=data.qpos.at[7:].set(targets)), jp.zeros_like(targets)
-
-    namespace = {"jax": jax, "jp": jp, "partial": partial, "torque_step": physics, "torque_step_dr": physics,
-                 "copy_state_containers": evaluation.copy_state_containers, "mjx_impl": lambda cfg: "jax"}
-    exec(compile(module, str(path), "exec"), namespace)
-    return {name: namespace[name] for name in wanted if name in namespace}
-
-
 def fake_native(family, residual, terminate, dr=False):
-    methods = native_methods(family, dr)
-    Env = type("NativeStepWithFakePhysics", (), methods)
-    env = Env()
-    env._config = SimpleNamespace(action_scale=2., student_use_residual_action=residual, history_len=0,
+    module = NATIVE_DR[family] if dr else NATIVE[family]
+    cls = module.G1TrackingGeneralDREnv if dr else module.G1TrackingGeneralEnv
+    # Bypass construction: this is the real class with only its physics,
+    # reference source, observation/reward reads and reset port substituted.
+    env = object.__new__(cls)
+    env._config = SimpleNamespace(ctrl_dt=.02, sim_dt=.002, action_scale=2., student_use_residual_action=residual, history_len=0,
                                   episode_length=100, reward_config=SimpleNamespace(scales={"target_sum": 1.}),
                                   push_config=SimpleNamespace(enable=False, magnitude_range=[.1, 1.]))
     env.action_joint_ids = jp.arange(29)
     env._default_qpos = jp.zeros(29)
     env._kps = env._kds = env.torque_limit = jp.ones(29)
-    env.mjx_model = None
-    env.n_substeps, env.dt = 10, .02
+    env._mjx_model = SimpleNamespace(nu=29)
+    env._ctrl_dt, env._sim_dt = .02, .002
     reference = SimpleNamespace(qpos=jp.concatenate([jp.zeros(7), jp.arange(29) / 10]))
     env.th = SimpleNamespace(get_current_traj_data_with_trajectory=lambda trajectory, carry: reference,
                              update_state_with_trajectory=lambda trajectory, carry: carry)
@@ -125,30 +107,17 @@ def fake_native(family, residual, terminate, dr=False):
     return env, fresh(jax.random.PRNGKey(7)), reference
 
 
-def actual_vector_wrapper(family, env):
-    path = ROOT / "track_mj/envs" / family / "utils/wrapper.py"
-    wanted = {"VmapWrapper", "_annotate_worldid"}
-    nodes = [node for node in ast.parse(path.read_text()).body
-             if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in wanted]
-    module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
-                              *nodes], type_ignores=[])
-    ast.fix_missing_locations(module)
-    class Wrapper:
-        def __init__(self, wrapped):
-            self.env = wrapped
-    namespace = {"jax": jax, "jp": jp, "Wrapper": Wrapper, "MJX_WORLD_AXIS_NAME": "test_worlds",
-                 "owned_data": evaluation.owned_data,
-                 "mjx": SimpleNamespace(forward=lambda model, data: data.replace(xpos=data.xpos + 10))}
-    exec(compile(module, str(path), "exec"), namespace)
-    return namespace["VmapWrapper"](env)
-
-
 class EvaluationBoundaryTests(unittest.TestCase):
-        # Keeping the old world's efc__id here would mix it with a new global
-        # contact order. Deliberately do not promise derived-cache identity.
-
-
-
+    def setUp(self):
+        self.substitutions = ExitStack()
+        self.addCleanup(self.substitutions.close)
+        for module in (*NATIVE.values(), *NATIVE_DR.values()):
+            port = "torque_step_dr" if module in NATIVE_DR.values() else "torque_step"
+            self.substitutions.enter_context(patch.object(module, port, side_effect=physics))
+            self.substitutions.enter_context(patch.object(module, "mjx_impl", return_value="jax"))
+        self.substitutions.enter_context(patch.object(
+            NATIVE["g1_tracking"].mjx, "forward",
+            side_effect=lambda model, data: data.replace(xpos=data.xpos + 10)))
 
     def test_actual_native_target_and_last_target_semantics(self):
         for family in ("g1_tracking", "g1_tracking_dagger"):
@@ -190,12 +159,11 @@ class EvaluationBoundaryTests(unittest.TestCase):
             np.testing.assert_array_equal(training.done, terminal.done)
 
 
-
     def test_vector_terminal_and_physical_measurement_are_separate(self):
         for family in ("g1_tracking", "g1_tracking_dagger"):
             env, _, _ = fake_native(family, False, False)
             env._get_termination = lambda data, reference, info: data.qpos[7] > .5
-            vector = actual_vector_wrapper(family, env)
+            vector = WRAPPERS[family].VmapWrapper(env)
             pre = vector.reset(jax.random.split(jax.random.PRNGKey(5), 2), object())
             saved = evaluation.copy_state_containers(pre)
             terminal = vector.step_no_autoreset(pre, jp.zeros((2, 29)).at[1, 0].set(1), object())
