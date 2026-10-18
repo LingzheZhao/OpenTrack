@@ -439,6 +439,57 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
 
         self.recalculate_vel_in_reward = self._config.recalculate_vel_in_reward
         self.recalculate_vel_in_reference_motion = self._config.recalculate_vel_in_reference_motion
+        self._configure_evaluation_physical_stop()
+
+    def _configure_evaluation_physical_stop(self):
+        """Validate the opt-in flat-ground walking safeguard, never a fall classifier."""
+        selected = self._config.get("evaluation_physical_stop")
+        self._evaluation_physical_stop = None
+        if selected is None:
+            return
+        required = {"root_link_height_min_m", "root_up_dot_min", "stop_on_nonfinite"}
+        if set(selected) != required or selected["stop_on_nonfinite"] is not True:
+            raise ValueError("physical evaluation requires explicit height/up-dot and mandatory nonfinite stop")
+        height, up = float(selected["root_link_height_min_m"]), float(selected["root_up_dot_min"])
+        if not np.isfinite(height) or height <= 0 or not np.isfinite(up) or not -1 < up < 1:
+            raise ValueError("physical evaluation thresholds must be finite positive height and up-dot in (-1,1)")
+        model = self.mj_model
+        pelvis, floor = model.body("pelvis").id, model.geom("floor").id
+        joint = int(model.body_jntadr[pelvis])
+        if (model.body_parentid[pelvis] != 0 or model.body_jntnum[pelvis] != 1
+                or model.jnt_type[joint] != mujoco.mjtJoint.mjJNT_FREE
+                or model.jnt_qposadr[joint] != 0 or model.jnt_dofadr[joint] != 0
+                or not np.array_equal(model.jnt_pos[joint], np.zeros(3))):
+            raise ValueError("physical evaluation requires qpos root to be the world-parent pelvis LINK origin")
+        if (model.geom_bodyid[floor] != 0 or model.geom_type[floor] != mujoco.mjtGeom.mjGEOM_PLANE
+                or not np.array_equal(np.abs(model.geom_quat[floor]), [1., 0., 0., 0.])
+                or not np.isfinite(model.geom_pos[floor]).all()):
+            raise ValueError("physical evaluation requires the declared horizontal world floor plane")
+        self._evaluation_physical_stop = {"root_link_height_min_m": height, "root_up_dot_min": up,
+            "stop_on_nonfinite": True, "floor_height_w_m": float(model.geom_pos[floor, 2]),
+            "root_body_id": int(pelvis), "floor_geom_id": int(floor)}
+
+    def evaluation_physical_stop_description(self):
+        """The concrete evaluation option, or None for unchanged native tracking."""
+        settings = getattr(self, "_evaluation_physical_stop", None)
+        return None if settings is None else {**settings, "mode": "walking_physical_v1",
+            "root_position_point": "pelvis_link_origin", "quaternion_order": "WXYZ",
+            "height_frame": "world_above_declared_floor", "up_axis": "pelvis_local_z_dot_world_z",
+            "truncation": "native_episode_horizon_only; reference clock still advances",
+            "interpretation": "bounded walking diagnostic safeguard, not a general physical-fall classifier"}
+
+    def _physical_stop_flags(self, data):
+        settings = self._evaluation_physical_stop
+        q = data.qpos[3:7]
+        norm2 = jp.sum(jp.square(q))
+        up_dot = (q[0] ** 2 - q[1] ** 2 - q[2] ** 2 + q[3] ** 2) / jp.where(norm2 > 0, norm2, 1.)
+        height = data.qpos[2] - settings["floor_height_w_m"]
+        return {"height_m": height, "up_dot": up_dot,
+            "height": height < settings["root_link_height_min_m"],
+            "tilt": up_dot < settings["root_up_dot_min"],
+            "nonfinite": (~jp.all(jp.isfinite(data.qpos)) | ~jp.all(jp.isfinite(data.qvel))
+                          | ~jp.isfinite(height) | ~jp.isfinite(up_dot)),
+            "invalid_quaternion": norm2 <= 0}
 
     def reset(self, rng: jax.Array, trajectory_data: TrajectoryData = None) -> mjx_env.State:
         # only use key to choose a new start
@@ -494,6 +545,9 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
             "traj_no": traj_no,
             "traj_info": carry,
         }
+
+        if self._evaluation_physical_stop is not None:
+            info["evaluation_physical_stop"] = self._physical_stop_flags(data)
 
         metrics = {}
         for k in self._config.reward_config.scales.keys():
@@ -557,6 +611,8 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
 
     def _step(self, state: mjx_env.State, action: jax.Array, trajectory_data: TrajectoryData,
               *, auto_reset: bool, capture_contacts: bool = False):
+        if auto_reset and getattr(self, "_evaluation_physical_stop", None) is not None:
+            raise ValueError("physical evaluation uses terminal-preserving steps, never training autoreset")
         if not auto_reset:
             state = copy_state_containers(state)
         if trajectory_data is None:
@@ -611,15 +667,20 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
 
         # get termination
         termination = self._get_termination(data, traj_data, state.info)
+        if getattr(self, "_evaluation_physical_stop", None) is not None:
+            state.info["evaluation_physical_stop"] = self._physical_stop_flags(data)
 
         # reference trajectory step
         state.info["traj_info"] = self.th.update_state_with_trajectory(trajectory_data, state.info["traj_info"])
         traj_data = self.th.get_current_traj_data_with_trajectory(trajectory_data, state.info["traj_info"])
 
         # get truncated conditions
-        truncated = (state.info["step"] >= self._config.episode_length) | (
-            state.info["traj_info"].traj_state.traj_no != state.info["traj_no"]
-        )
+        if getattr(self, "_evaluation_physical_stop", None) is None:
+            truncated = (state.info["step"] >= self._config.episode_length) | (
+                state.info["traj_info"].traj_state.traj_no != state.info["traj_no"]
+            )
+        else:
+            truncated = state.info["step"] >= self._config.episode_length
         state.info["truncation"] = truncated.astype(jp.float32)
 
         done = termination | truncated
@@ -859,6 +920,9 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
             self._viewer = None
 
     def _get_termination(self, data: mjx.Data, traj_data: TrajectoryData, info: dict[str, Any]) -> jax.Array:
+        if getattr(self, "_evaluation_physical_stop", None) is not None:
+            flags = self._physical_stop_flags(data)
+            return flags["height"] | flags["tilt"] | flags["nonfinite"] | flags["invalid_quaternion"]
         fall_termination = jp.abs(data.qpos[2] - traj_data.qpos[2]) > self._config.termination_config.root_height_threshold
 
         # NOTICE: rigid body with id 0 is world!

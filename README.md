@@ -246,6 +246,36 @@ performed. Recording changes the compiled output graph; CPU fake-physics checks
 do not establish numerical neutrality. Compare instrumented native runs against
 uninstrumented native repeats before using the forces in a result.
 
+### Opt-in walking evaluation safeguard
+
+`G1TrackingGeneralEnv` keeps reference-tracking termination by default. For a
+bounded walking diagnostic, set the following environment configuration before
+construction and use only `step_no_autoreset` or `step_with_contacts`:
+
+```python
+evaluation_physical_stop = dict(
+    root_link_height_min_m=0.35,
+    root_up_dot_min=0.5,
+    stop_on_nonfinite=True,
+)
+```
+
+This option validates a world-parent pelvis free joint and horizontal world floor.
+It stops on pelvis LINK height below the declared floor-relative threshold, local
+pelvis up-axis dot world-up below the threshold, nonfinite qpos/qvel, or a zero
+root quaternion. It uses current generalized root coordinates, not stale body
+caches. The named flags and measured height/up-dot are retained in
+`state.info["evaluation_physical_stop"]`; `evaluation_physical_stop_description()`
+reports the binding. This is a diagnostic safeguard, not a general fall classifier.
+
+The shared physics loop, reference advance, observations and RNG remain in use.
+Only this option suppresses reference-change truncation; native episode horizon
+still truncates. Both the termination reward and done use the selected physical
+predicate before the done-dependent counter update. Training autoreset rejects
+this option. Default tracking termination, reward, counters and truncation retain
+their original calculations. Contacts, when requested, remain actual substep
+measurements and do not add a contact-based stopping rule.
+
 ### Evaluate the specialist teachers
 
   ```shell
