@@ -38,6 +38,11 @@ class PhysicalEvaluationTests(unittest.TestCase):
         self.assertFalse(bool(value._get_termination(upright_yaw, None, {})))
         self.assertAlmostEqual(float(value._physical_stop_flags(data(quaternion=(2., 0., 0., 0.)))['up_dot']), 1.)
         self.assertTrue(bool(value._physical_stop_flags(data(quaternion=(0., 0., 0., 0.)))['invalid_quaternion']))
+        info = {}
+        self.assertFalse(bool(value._get_termination(data(quaternion=(0., 1., 0., 0.)), None, info, jp.array(False))))
+        self.assertTrue(bool(info['posture_termination']['tilt']))
+        self.assertFalse(bool(info['posture_termination']['terminated']))
+        self.assertTrue(bool(value._get_termination(data(quaternion=(0., 0., 0., 0.)), None, {}, jp.array(False))))
 
     def test_infinity_and_nan_always_stop_without_a_reference(self):
         value = env()
@@ -45,6 +50,7 @@ class PhysicalEvaluationTests(unittest.TestCase):
             current = data()
             current.qvel = current.qvel.at[-1].set(bad)
             self.assertTrue(bool(value._get_termination(current, None, {})))
+            self.assertTrue(bool(value._get_termination(current, None, {}, jp.array(False))))
             self.assertTrue(bool(value._physical_stop_flags(current)['nonfinite']))
 
     def test_default_tracking_still_uses_reference_and_body_threshold(self):

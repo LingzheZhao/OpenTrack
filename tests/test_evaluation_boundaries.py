@@ -190,6 +190,37 @@ class EvaluationBoundaryTests(unittest.TestCase):
         self.assertNotEqual(owned["qpos"].unsafe_buffer_pointer(), source["qpos"].unsafe_buffer_pointer())
         self.assertFalse(evaluation.contact_measurement()["available"])
 
+    def test_posture_control_precedes_native_done_counter_and_selective_reset(self):
+        env, _, _ = fake_native('g1_tracking_dagger', False, False)
+        env._evaluation_physical_stop = dict(root_link_height_min_m=.35, root_up_dot_min=.5, floor_height_w_m=0.)
+        env._get_termination = type(env)._get_termination.__get__(env)
+        vector = WRAPPERS['g1_tracking_dagger'].VmapWrapper(env)
+        pre = vector.reset(jax.random.split(jax.random.PRNGKey(5), 2), object())
+        pre = pre.replace(data=pre.data.replace(qpos=pre.data.qpos.at[:,2].set(.8)))
+        action = jp.zeros((2,29))
+        plain = vector.step_no_autoreset(pre, action, object())
+        enabled = vector.step_no_autoreset(pre, action, object(), jp.array(True))
+        assert_tree_equal(self, plain, enabled.replace(info={key:value for key,value in enabled.info.items()
+            if key != 'posture_termination'}))
+        mixed = pre.replace(data=pre.data.replace(qpos=pre.data.qpos.at[0,3:7].set(jp.array([0.,1.,0.,0.])),
+            qvel=pre.data.qvel.at[1,-1].set(jp.nan)))
+        terminal = vector.step_no_autoreset(mixed, action, object(), jp.array(False))
+        np.testing.assert_array_equal(terminal.done, [False, True])
+        np.testing.assert_array_equal(terminal.info['step'], [1,0])
+        self.assertTrue(bool(terminal.info['posture_termination']['tilt'][0]))
+        self.assertFalse(bool(terminal.info['posture_termination']['terminated'][0]))
+        reset = vector.reset_done(terminal, object())
+        for original, continued in zip(jax.tree_util.tree_leaves(terminal), jax.tree_util.tree_leaves(reset)):
+            np.testing.assert_array_equal(original[0], continued[0])
+        outside = vector.step_no_autoreset(reset, action, object(), jp.array(True))
+        self.assertTrue(bool(outside.done[0]))
+        self.assertEqual(int(outside.info['step'][0]), 0)
+        timeout = pre.replace(info={**pre.info,'step':jp.full((2,),env._config.episode_length-1)})
+        timed = vector.step_no_autoreset(timeout, action, object(), jp.array(False))
+        np.testing.assert_array_equal(timed.done, [True, True])
+        np.testing.assert_array_equal(timed.info['truncation'], [True, True])
+        np.testing.assert_array_equal(timed.info['posture_termination']['terminated'], [False, False])
+
 
 if __name__ == "__main__":
     unittest.main()

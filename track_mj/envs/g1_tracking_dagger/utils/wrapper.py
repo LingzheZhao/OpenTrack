@@ -100,8 +100,12 @@ class VmapWrapper(Wrapper):
             state, action, use_residual_action, trajectory_data
         )
 
-    def step_no_autoreset(self, state: State, action: jax.Array, trajectory_data=None) -> State:
+    def step_no_autoreset(self, state: State, action: jax.Array, trajectory_data=None,
+                          posture_termination_enabled=None) -> State:
         """Vectorize the native terminal-preserving physical step."""
+        if posture_termination_enabled is not None:
+            return jax.vmap(self.env.step_no_autoreset, in_axes=(0, 0, None, None), axis_name=MJX_WORLD_AXIS_NAME)(
+                state, action, trajectory_data, posture_termination_enabled)
         return jax.vmap(self.env.step_no_autoreset, in_axes=(0, 0, None), axis_name=MJX_WORLD_AXIS_NAME)(
             state, action, trajectory_data
         )

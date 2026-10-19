@@ -549,6 +549,13 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
                           | ~jp.isfinite(height) | ~jp.isfinite(up_dot)),
             "invalid_quaternion": norm2 <= 0}
 
+    def posture_termination(self, flags, enabled):
+        """Apply task posture applicability without suppressing numerical failure."""
+        enabled = jp.asarray(enabled, dtype=jp.bool_)
+        terminated = ((flags["height"] | flags["tilt"]) & enabled
+                      | flags["nonfinite"] | flags["invalid_quaternion"])
+        return {**flags, "enabled": enabled, "terminated": terminated}
+
     def reset(self, rng: jax.Array, trajectory_data: TrajectoryData = None, *, obstacle_centers=None) -> mjx_env.State:
         # only use key to choose a new start
         if trajectory_data is None:
@@ -657,12 +664,15 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         return self._step(state, action, trajectory_data, auto_reset=True)
 
     def step_no_autoreset(self, state: mjx_env.State, action: jax.Array,
-                          trajectory_data: TrajectoryData = None) -> mjx_env.State:
+                          trajectory_data: TrajectoryData = None,
+                          posture_termination_enabled=None) -> mjx_env.State:
         """The same physical advance and observations, retaining the terminal state."""
-        return self._step(state, action, trajectory_data, auto_reset=False)
+        return self._step(state, action, trajectory_data, auto_reset=False,
+                          posture_termination_enabled=posture_termination_enabled)
 
     def step_with_contacts(self, state: mjx_env.State, action: jax.Array,
-                           trajectory_data: TrajectoryData = None):
+                           trajectory_data: TrajectoryData = None,
+                           posture_termination_enabled=None):
         """Advance without autoreset; return terminal state and 500 Hz solved forces.
 
         This explicit measurement path supports native JAX Euler only. Body
@@ -670,10 +680,13 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         implied. Instrumented numerical neutrality needs native validation.
         """
         _require_contact_backend(self.mjx_model, state.data)
-        return self._step(state, action, trajectory_data, auto_reset=False, capture_contacts=True)
+        return self._step(state, action, trajectory_data, auto_reset=False, capture_contacts=True,
+                          posture_termination_enabled=posture_termination_enabled)
 
     def _step(self, state: mjx_env.State, action: jax.Array, trajectory_data: TrajectoryData,
-              *, auto_reset: bool, capture_contacts: bool = False):
+              *, auto_reset: bool, capture_contacts: bool = False, posture_termination_enabled=None):
+        if posture_termination_enabled is not None and self._evaluation_physical_stop is None:
+            raise ValueError("posture termination control requires the selected physical termination rule")
         if auto_reset and getattr(self, "_evaluation_physical_stop", None) is not None:
             raise ValueError("physical evaluation uses terminal-preserving steps, never training autoreset")
         if not auto_reset:
@@ -729,7 +742,9 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         state.info["last_joint_vel"] = data.qvel[6:].copy()
 
         # get termination
-        termination = self._get_termination(data, traj_data, state.info)
+        termination = (self._get_termination(data, traj_data, state.info)
+                       if posture_termination_enabled is None else
+                       self._get_termination(data, traj_data, state.info, posture_termination_enabled))
         if getattr(self, "_evaluation_physical_stop", None) is not None:
             state.info["evaluation_physical_stop"] = self._physical_stop_flags(data)
 
@@ -982,9 +997,14 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
             del self._viewer
             self._viewer = None
 
-    def _get_termination(self, data: mjx.Data, traj_data: TrajectoryData, info: dict[str, Any]) -> jax.Array:
+    def _get_termination(self, data: mjx.Data, traj_data: TrajectoryData, info: dict[str, Any],
+                         posture_termination_enabled=None) -> jax.Array:
         if getattr(self, "_evaluation_physical_stop", None) is not None:
             flags = self._physical_stop_flags(data)
+            if posture_termination_enabled is not None or "posture_termination" in info:
+                info["posture_termination"] = self.posture_termination(flags,
+                    True if posture_termination_enabled is None else posture_termination_enabled)
+                return info["posture_termination"]["terminated"]
             return flags["height"] | flags["tilt"] | flags["nonfinite"] | flags["invalid_quaternion"]
         fall_termination = jp.abs(data.qpos[2] - traj_data.qpos[2]) > self._config.termination_config.root_height_threshold
 
