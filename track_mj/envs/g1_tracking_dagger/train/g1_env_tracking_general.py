@@ -203,6 +203,9 @@ class ContactSamples(NamedTuple):
     constraint_present: jax.Array
     normal_n: jax.Array
     total_force_world_n: jax.Array
+    ground_normal_force_world_by_body_n: jax.Array
+    ground_total_force_world_by_body_n: jax.Array
+    ground_contact_found_by_body: jax.Array
 
 
 def _require_contact_backend(model, data):
@@ -236,8 +239,16 @@ def _solved_contact_sample(model, data, interval_start):
         result = result.at[bodies[:, 0]].add(-values)
         return result.at[bodies[:, 1]].add(values)
 
+    # A plane is the explicitly supported ground source, never robot self-contact.
+    plane = jp.asarray(model.geom_type) == int(mujoco.mjtGeom.mjGEOM_PLANE)
+    ground = present & jp.any(plane[jp.maximum(geom, 0)], axis=-1)
+    ground_normal = body_sum(jp.where(ground[:, None], normal, 0.))
+    ground_total = body_sum(jp.where(ground[:, None], total, 0.))
+    found = jp.zeros((model.nbody,), dtype=jp.int32)
+    found = found.at[bodies[:, 0]].add(ground.astype(jp.int32))
+    found = found.at[bodies[:, 1]].add(ground.astype(jp.int32))
     return ContactSamples(interval_start, data.time, body_sum(total), body_sum(normal),
-                          geom, present, normal_n, total)
+                          geom, present, normal_n, total, ground_normal, ground_total, found > 0)
 
 
 def _torque_step(
@@ -316,13 +327,58 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         terrain_type: str = "flat_terrain",
         config: config_dict.ConfigDict = None,
         config_overrides: Optional[Dict[str, Union[str, int, list[Any]]]] = None,
+        *, model_spec: Optional[mujoco.MjSpec] = None,
+        obstacle_geom_names: tuple[str, ...] = (),
+        obstacle_placement_frame: str = "environment",
+        reference_mode: str = "tracking",
     ):
         super().__init__(
             xml_path=consts.task_to_xml(terrain_type).as_posix(),
             config=config,
             config_overrides=config_overrides,
+            model_spec=model_spec,
         )
+        if reference_mode not in ("tracking", "initialization_only"):
+            raise ValueError("reference_mode must be tracking or initialization_only")
+        if obstacle_placement_frame not in ("environment", "initial_root_yaw"):
+            raise ValueError("obstacle placement must be environment or initial_root_yaw")
+        if (obstacle_geom_names or reference_mode != "tracking") and mjx_impl(self._config) != "jax":
+            raise NotImplementedError("native physical scenes and held reference currently require MJX JAX")
+        self.reference_mode = reference_mode
+        self.obstacle_placement_frame = obstacle_placement_frame
+        self.obstacle_geom_ids = tuple(int(self.mj_model.geom(name).id) for name in obstacle_geom_names)
+        if any(int(self.mj_model.geom_bodyid[i]) != 0 for i in self.obstacle_geom_ids):
+            raise ValueError("native per-world obstacles must be fixed world geoms")
+        self._obstacle_centers = jp.asarray(self.mj_model.geom_pos[list(self.obstacle_geom_ids)])
         self._post_init()
+        if reference_mode == "initialization_only" and self._evaluation_physical_stop is None:
+            raise ValueError("held reference requires explicit physical evaluation termination")
+
+    def model_for_centers(self, centers):
+        if not self.obstacle_geom_ids:
+            return self.mjx_model
+        return self.mjx_model.replace(geom_pos=self.mjx_model.geom_pos.at[jp.asarray(self.obstacle_geom_ids)].set(centers))
+
+    def model_for_state(self, state):
+        return self.model_for_centers(state.info.get("physical_obstacle_centers", self._obstacle_centers))
+
+    def _place_obstacles(self, qpos):
+        centers = self._obstacle_centers
+        if self.obstacle_placement_frame == "initial_root_yaw":
+            # Only yaw and xy placement: z stays the declared world-floor height.
+            q = qpos[3:7]
+            yaw = jp.arctan2(2 * (q[0]*q[3] + q[1]*q[2]), 1 - 2*(q[2]**2 + q[3]**2))
+            c, sn = jp.cos(yaw), jp.sin(yaw)
+            x, y = centers[:, 0], centers[:, 1]
+            centers = centers.at[:, 0].set(c*x-sn*y+qpos[0]).at[:, 1].set(sn*x+c*y+qpos[1])
+        return centers
+
+    def _advance_reference(self, trajectory_data, carry):
+        if self.reference_mode == "tracking":
+            return self.th.update_state_with_trajectory(trajectory_data, carry)
+        state = carry.traj_state
+        length = trajectory_data.split_points[state.traj_no+1] - trajectory_data.split_points[state.traj_no]
+        return carry.replace(traj_state=state.replace(subtraj_step_no=jp.minimum(state.subtraj_step_no+1, length-1)))
 
     def _post_init(self) -> None:
         self.num_joints = self.mjx_model.nq - 7
@@ -491,7 +547,7 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
                           | ~jp.isfinite(height) | ~jp.isfinite(up_dot)),
             "invalid_quaternion": norm2 <= 0}
 
-    def reset(self, rng: jax.Array, trajectory_data: TrajectoryData = None) -> mjx_env.State:
+    def reset(self, rng: jax.Array, trajectory_data: TrajectoryData = None, *, obstacle_centers=None) -> mjx_env.State:
         # only use key to choose a new start
         if trajectory_data is None:
             trajectory_data = self.th.traj.data
@@ -520,11 +576,14 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         noisy_init_qpos = noisy_init_qpos.at[3:7].set(noisy_init_root_quat)
 
         data = self._init_mjx_data(qpos=noisy_init_qpos, qvel=init_traj_data.qvel, ctrl=noisy_init_qpos[7:])
+        if self.obstacle_geom_ids:
+            obstacle_centers = self._place_obstacles(noisy_init_qpos) if obstacle_centers is None else obstacle_centers
+            data = mjx.forward(self.model_for_centers(obstacle_centers), data)
 
         traj_no = carry.traj_state.traj_no
 
         # update to get the reference trajectory step
-        carry = self.th.update_state_with_trajectory(trajectory_data, carry)
+        carry = self._advance_reference(trajectory_data, carry)
         traj_data = self.th.get_current_traj_data_with_trajectory(trajectory_data, carry)
 
         rng = carry.key
@@ -546,6 +605,8 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
             "traj_info": carry,
         }
 
+        if self.obstacle_geom_ids:
+            info["physical_obstacle_centers"] = obstacle_centers
         if self._evaluation_physical_stop is not None:
             info["evaluation_physical_stop"] = self._physical_stop_flags(data)
 
@@ -626,7 +687,7 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         if capture_contacts:
             state.info["rng"], data, torque, samples = torque_step_with_contacts(
                 state.info["rng"],
-                self.mjx_model,
+                self.model_for_state(state),
                 state.data,
                 motor_targets,
                 kps=self._kps,
@@ -637,7 +698,7 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         else:
             state.info["rng"], data, torque = torque_step(
                 state.info["rng"],
-                self.mjx_model,
+                self.model_for_state(state),
                 state.data,
                 motor_targets,
                 kps=self._kps,
@@ -671,7 +732,7 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
             state.info["evaluation_physical_stop"] = self._physical_stop_flags(data)
 
         # reference trajectory step
-        state.info["traj_info"] = self.th.update_state_with_trajectory(trajectory_data, state.info["traj_info"])
+        state.info["traj_info"] = self._advance_reference(trajectory_data, state.info["traj_info"])
         traj_data = self.th.get_current_traj_data_with_trajectory(trajectory_data, state.info["traj_info"])
 
         # get truncated conditions

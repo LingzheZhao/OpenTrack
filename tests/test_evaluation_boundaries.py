@@ -82,6 +82,8 @@ def fake_native(family, residual, terminate, dr=False):
     env._default_qpos = jp.zeros(29)
     env._kps = env._kds = env.torque_limit = jp.ones(29)
     env._mjx_model = SimpleNamespace(nu=29)
+    if family == "g1_tracking_dagger":
+        env.obstacle_geom_ids, env._obstacle_centers, env.reference_mode = (), jp.zeros((0,3)), "tracking"
     env._ctrl_dt, env._sim_dt = .02, .002
     reference = SimpleNamespace(qpos=jp.concatenate([jp.zeros(7), jp.arange(29) / 10]))
     env.th = SimpleNamespace(get_current_traj_data_with_trajectory=lambda trajectory, carry: reference,
@@ -90,7 +92,7 @@ def fake_native(family, residual, terminate, dr=False):
     env._get_termination = lambda data, reference, info: jp.array(terminate)
     env._get_obs = lambda data, reference, info: ({"state": info["last_motor_targets"]}, jp.zeros(0))
 
-    def fresh(key, trajectory=None):
+    def fresh(key, trajectory=None, *, obstacle_centers=None):
         info = {"rng": key, "step": jp.array(0), "traj_no": jp.array(0),
                 "traj_info": Carry(TrajState(jp.array(0))), "truncation": jp.array(0.),
                 "last_motor_targets": jp.zeros(29), "last_action": jp.zeros(29), "last_root_pos": jp.zeros(3),
@@ -173,6 +175,13 @@ class EvaluationBoundaryTests(unittest.TestCase):
             np.testing.assert_array_equal(physical.xpos, jp.full((2, 1, 3), 10))
             np.testing.assert_array_equal(terminal.data.xpos, jp.zeros((2, 1, 3)))
             assert_tree_equal(self, pre, saved)
+            if family == "g1_tracking_dagger":
+                reset = vector.reset_done(terminal, object())
+                for original, continued in zip(jax.tree_util.tree_leaves(terminal), jax.tree_util.tree_leaves(reset)):
+                    np.testing.assert_array_equal(original[0], continued[0])
+                self.assertFalse(bool(reset.done[1]))
+                np.testing.assert_array_equal(reset.info['truncation'], [0., 0.])
+                self.assertFalse(np.array_equal(reset.info['rng'][1], terminal.info['rng'][1]))
 
     def test_physical_measurement_owns_its_array_storage(self):
         source = {"qpos": jp.ones((2, 3))}

@@ -23,7 +23,7 @@ CONTACT = SimpleNamespace(
     frame=jp.array([[[0., 0., 1.], [1., 0., 0.], [0., 1., 0.]],
                     np.eye(3), np.eye(3), np.eye(3)]),
 )
-MODEL = SimpleNamespace(impl=mjx.Impl.JAX, nbody=3, geom_bodyid=np.array([0, 1, 2]),
+MODEL = SimpleNamespace(impl=mjx.Impl.JAX, nbody=3, geom_bodyid=np.array([0, 1, 2]), geom_type=np.array([0, 2, 2]),
                         opt=SimpleNamespace(integrator=mjx.IntegratorType.EULER))
 
 
@@ -85,6 +85,9 @@ class SubstepContactTests(unittest.TestCase):
                                       [[-2, 0, -10], [7, -1, 13], [-5, 1, -3]])
         np.testing.assert_array_equal(sample.normal_force_world_by_body_n,
                                       [[0, 0, -10], [5, 0, 10], [-5, 0, 0]])
+        np.testing.assert_array_equal(sample.ground_normal_force_world_by_body_n,
+                                      [[0, 0, -10], [0, 0, 10], [0, 0, 0]])
+        np.testing.assert_array_equal(sample.ground_contact_found_by_body, [True, True, False])
         np.testing.assert_array_equal(sample.normal_n, [10, 5, 0, 0])
         np.testing.assert_array_equal(sample.constraint_present, [True, True, False, False])
         np.testing.assert_array_equal(sample.total_force_world_n[2:], jp.zeros((2, 3)))
@@ -129,11 +132,12 @@ class SubstepContactTests(unittest.TestCase):
     def test_environment_keeps_terminal_state_and_input_containers(self):
         real = native.G1TrackingGeneralEnv
         Env = type('FakePhysicsEnv', (), {name: getattr(real, name) for name in
-                   ('step', 'step_no_autoreset', 'step_with_contacts', '_step', '_get_motor_targets')})
+                   ('step', 'step_no_autoreset', 'step_with_contacts', '_step', '_get_motor_targets', 'model_for_state', 'model_for_centers', '_advance_reference')})
         env = Env()
         env._config = SimpleNamespace(student_use_residual_action=True, action_scale=1., history_len=0,
                                      episode_length=100, reward_config=SimpleNamespace(scales={'x': 1.}))
         env.mjx_model = MODEL
+        env.obstacle_geom_ids, env._obstacle_centers, env.reference_mode = (), jp.zeros((0,3)), "tracking"
         env.action_joint_ids = jp.arange(29)
         env._default_qpos = jp.zeros(29)
         env._kps = env._kds = env.torque_limit = jp.ones(29)
