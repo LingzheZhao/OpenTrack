@@ -531,7 +531,9 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         return None if settings is None else {**settings, "mode": "walking_physical_v1",
             "root_position_point": "pelvis_link_origin", "quaternion_order": "WXYZ",
             "height_frame": "world_above_declared_floor", "up_axis": "pelvis_local_z_dot_world_z",
-            "truncation": "native_episode_horizon_only; reference clock still advances",
+            "truncation": "native_episode_horizon_only",
+            "reference_end": ("hold_final_row_without_physical_reset"
+                if getattr(self, "reference_mode", "tracking") == "initialization_only" else "native_advance_and_wrap"),
             "interpretation": "bounded walking diagnostic safeguard, not a general physical-fall classifier"}
 
     def _physical_stop_flags(self, data):
