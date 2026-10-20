@@ -7,6 +7,7 @@ import mujoco.mjx as mjx
 from brax.envs.base import Env, State, Wrapper
 from mujoco_playground._src import mjx_env, wrapper
 from track_mj.utils.mjx_backend import MJX_WORLD_AXIS_NAME, mjx_impl
+from track_mj.utils.warp_obstacles import select_warp_reset_data_and_forward
 from track_mj.envs.evaluation import owned_data
 
 
@@ -112,6 +113,41 @@ class VmapWrapper(Wrapper):
 
     def reset_done(self, state: State, trajectory_data) -> State:
         """Reset actual done worlds; retain all unselected state and key leaves."""
+        if getattr(self.env, "_warp_obstacle_mode", None) == "mocap_sensors":
+            done = state.done.astype(bool)
+
+            def fresh_world(world):
+                key, _ = jax.random.split(world.info["rng"])
+                reset = self.env.reset(key, trajectory_data,
+                    obstacle_centers=world.info["physical_obstacle_centers"])
+                info = {**world.info, **reset.info}
+                if "truncation" in info:
+                    info["truncation"] = jp.zeros_like(info["truncation"])
+                return reset.replace(info=info)
+
+            fresh = jax.vmap(fresh_world, axis_name=MJX_WORLD_AXIS_NAME)(state)
+            data = select_warp_reset_data_and_forward(
+                self.env.mjx_model, state.data, fresh.data, done)
+
+            def select(reset_value, live_value):
+                if not hasattr(live_value, "shape"):
+                    if reset_value != live_value:
+                        raise ValueError("non-array Warp reset state cannot vary by world")
+                    return live_value
+                if live_value.shape[:1] != done.shape or reset_value.shape != live_value.shape:
+                    raise ValueError("Warp reset state must keep one owned value per world")
+                mask = done.reshape(done.shape + (1,) * (live_value.ndim - 1))
+                return jp.where(mask, reset_value, live_value)
+
+            return state.replace(
+                data=data,
+                obs=jax.tree_util.tree_map(select, fresh.obs, state.obs),
+                reward=select(fresh.reward, state.reward),
+                done=select(fresh.done, state.done),
+                metrics=jax.tree_util.tree_map(select, fresh.metrics, state.metrics),
+                info=jax.tree_util.tree_map(select, fresh.info, state.info),
+            )
+
         def reset_one(world):
             key, _ = jax.random.split(world.info["rng"])
             reset = self.env.reset(key, trajectory_data,

@@ -1,19 +1,21 @@
 """Candidate native Warp pillar geometry and contact-sensor contract.
 
-This module does not enable Warp obstacles in the tracking environment. The
-current JAX-only guard remains until per-world reset, substep timing and
-physical readback have been verified in the full G1 environment.
+The opt-in tracking environment path consumes these helpers. Downstream task
+admission remains separate until per-world reset, substep timing and physical
+readback have been verified in the full G1 environment.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jp
 import mujoco
 from mujoco import mjx
+import numpy as np
 
 
 CONTACT_SLOTS = 4
@@ -35,6 +37,34 @@ class PairSensor:
     pillar_geom: str
     address: int
     slots: int
+
+
+class PillarSubstep(NamedTuple):
+    """Solved pair readings for one physics interval.
+
+    The two force fields are maxima over individual matching contacts, not a
+    summed link, body or pillar force. ``force[0]`` is the MuJoCo contact-frame
+    normal component; the 3D norm is frame invariant. ``found`` is the full
+    native match count, including contacts beyond the sensor's stored slots.
+    """
+    interval_start_s: object
+    interval_end_s: object
+    pair_found_count: object
+    pair_geometric_contact: object
+    pair_max_normal_force_n: object
+    pair_max_total_force_n: object
+    overflow_code: object
+    pair_sensor_invalid: object
+    invalid: object
+
+
+def physical_robot_geom_names(model: mujoco.MjModel, root_body_id: int) -> tuple[str, ...]:
+    """Native robot collision geoms, including those enabled by explicit pairs."""
+    robot = np.asarray(model.body_rootid)[np.asarray(model.geom_bodyid)] == root_body_id
+    paired = np.concatenate((np.asarray(model.pair_geom1), np.asarray(model.pair_geom2)))
+    enabled = (np.asarray(model.geom_contype) != 0) | (np.asarray(model.geom_conaffinity) != 0)
+    enabled[np.asarray(paired, dtype=np.int64)] = True
+    return tuple(model.geom(int(i)).name for i in np.flatnonzero(robot & enabled))
 
 
 def add_mocap_pillar(spec: mujoco.MjSpec, *, name: str, center_xyz: tuple[float, float, float],
@@ -95,6 +125,31 @@ def pair_sensor_layout(model: mujoco.MjModel, names: tuple[str, ...]) -> tuple[P
     return tuple(result)
 
 
+def require_complete_pillar_coverage(model: mujoco.MjModel, *, obstacle_names: tuple[str, ...],
+                                     sensor_names: tuple[str, ...], root_body_id: int) -> tuple[PairSensor, ...]:
+    """Require a native contact sensor and explicit pair for every robot–pillar geom."""
+    layout = pair_sensor_layout(model, sensor_names)
+    robot = physical_robot_geom_names(model, root_body_id)
+    expected = {(name, obstacle) for name in robot for obstacle in obstacle_names}
+    measured = {(entry.robot_geom, entry.pillar_geom) for entry in layout}
+    if not obstacle_names or len(measured) != len(layout) or measured != expected:
+        raise ValueError("Warp pillar sensors do not cover every native robot–pillar geom pair")
+    actual_pairs = {frozenset((int(a), int(b))) for a, b in
+                    zip(model.pair_geom1, model.pair_geom2)}
+    for name, obstacle in expected:
+        ids = frozenset((int(model.geom(name).id), int(model.geom(obstacle).id)))
+        if ids not in actual_pairs:
+            raise ValueError(f"native explicit collision pair is missing: {name}, {obstacle}")
+    for obstacle in obstacle_names:
+        geom_id = int(model.geom(obstacle).id)
+        body_id = int(model.geom_bodyid[geom_id])
+        if (int(model.geom_type[geom_id]) != int(mujoco.mjtGeom.mjGEOM_CYLINDER)
+                or int(model.body_mocapid[body_id]) < 0
+                or not np.allclose(model.geom_pos[geom_id], 0)):
+            raise ValueError(f"{obstacle}: expected a true cylinder centered on its mocap body")
+    return layout
+
+
 def decode_pair_sensor(sensordata, sensor: PairSensor):
     """Read one world's sensor without treating truncated slots as complete."""
     values = jp.asarray(sensordata)[sensor.address:sensor.address + sensor.slots * FLOATS_PER_SLOT]
@@ -126,6 +181,24 @@ def warp_measurement_invalid(data, pair_readings) -> object:
         jp.asarray([reading["invalid"] for reading in pair_readings]))
 
 
+def sample_warp_pillar_contacts(data, interval_start, layout: tuple[PairSensor, ...]) -> PillarSubstep:
+    """Read solved native contact sensors from the actual post-step data."""
+    if not layout:
+        raise ValueError("Warp pillar samples require a complete declared sensor layout")
+    readings = tuple(decode_pair_sensor(data.sensordata, pair) for pair in layout)
+    return PillarSubstep(
+        interval_start_s=interval_start,
+        interval_end_s=data.time,
+        pair_found_count=jp.stack([item["found_count"] for item in readings]),
+        pair_geometric_contact=jp.stack([item["geometric_contact"] for item in readings]),
+        pair_max_normal_force_n=jp.stack([item["max_normal_force_n"] for item in readings]),
+        pair_max_total_force_n=jp.stack([item["max_total_force_n"] for item in readings]),
+        overflow_code=jp.asarray(data._impl.overflow),
+        pair_sensor_invalid=jp.stack([item["invalid"] for item in readings]),
+        invalid=warp_measurement_invalid(data, readings),
+    )
+
+
 def select_warp_reset_data_and_forward(model, live, fresh, done):
     """Select data in each world, then refresh outside any reset branch.
 
@@ -139,4 +212,9 @@ def select_warp_reset_data_and_forward(model, live, fresh, done):
     if jp.asarray(done).ndim != 1:
         raise ValueError("selective Warp reset requires one decision per world")
     selected = jax.vmap(lambda current, reset, flag: current.where(flag, reset))(live, fresh, done)
-    return jax.vmap(lambda world: mjx.forward(model, world))(selected)
+    forwarded = jax.vmap(lambda world: mjx.forward(model, world))(selected)
+    # The unconditional forward may rewrite solver/contact/warmstart leaves in
+    # every world. Restore the entire unselected native Data, not only qpos and
+    # qvel, so its next physics step starts from the original owned state.
+    return jax.vmap(lambda current, reset, flag: current.where(flag, reset))(
+        live, forwarded, done)

@@ -13,6 +13,9 @@ from mujoco import MjData, mjx
 from mujoco.mjx._src import math
 from mujoco_playground._src import mjx_env
 from track_mj.utils.mjx_backend import geoms_colliding, mjx_impl
+from track_mj.utils.warp_obstacles import (
+    PillarSubstep, require_complete_pillar_coverage, sample_warp_pillar_contacts,
+)
 from track_mj.envs.evaluation import copy_state_containers
 
 import track_mj as tmj  
@@ -270,10 +273,15 @@ def _torque_step(
     kds: jax.Array,
     torque_limit: jax.Array,
     n_substeps: int = 1,
-    *, capture_contacts: bool = False,
-) -> tuple[jax.Array, mjx.Data, jax.Array, ContactSamples | None]:
+    *, capture_contacts: bool = False, pillar_sensor_layout=(),
+) -> tuple[jax.Array, mjx.Data, jax.Array, ContactSamples | PillarSubstep | None]:
+    if capture_contacts and pillar_sensor_layout:
+        raise ValueError("one physics loop cannot select both contact measurement modes")
     if capture_contacts:
         _require_contact_backend(model, data)
+    if pillar_sensor_layout and (model.impl != mjx.Impl.WARP
+                                 or model.opt.integrator != mjx.IntegratorType.EULER):
+        raise NotImplementedError("Warp pillar sensors require native Warp Euler physics")
 
     def single_step(carry, _):
         rng, data, _ = carry
@@ -289,9 +297,14 @@ def _torque_step(
 
         # apply torque
         data = data.replace(ctrl=torque)
-        interval_start = data.time if capture_contacts else None
+        interval_start = data.time if (capture_contacts or pillar_sensor_layout) else None
         data = mjx.step(model, data)
-        samples = _solved_contact_sample(model, data, interval_start) if capture_contacts else None
+        if capture_contacts:
+            samples = _solved_contact_sample(model, data, interval_start)
+        elif pillar_sensor_layout:
+            samples = sample_warp_pillar_contacts(data, interval_start, pillar_sensor_layout)
+        else:
+            samples = None
 
         return (rng, data, torque), samples
 
@@ -313,6 +326,15 @@ def torque_step_with_contacts(rng, model, data, qpos_des, kps, kds, torque_limit
     """The same physics loop, returning actual solved contact samples too."""
     return _torque_step(rng, model, data, qpos_des, kps, kds, torque_limit,
                         n_substeps, capture_contacts=True)
+
+
+def torque_step_with_pillar_sensors(rng, model, data, qpos_des, kps, kds, torque_limit,
+                                    sensor_layout, n_substeps=1):
+    """Share the native PD loop; sample each Warp solve through public sensors."""
+    if not sensor_layout:
+        raise ValueError("Warp pillar sensing requires the complete native sensor layout")
+    return _torque_step(rng, model, data, qpos_des, kps, kds, torque_limit,
+                        n_substeps, pillar_sensor_layout=sensor_layout)
 
 
 def get_collision_contact(contact: Any, geom1: int, geom2: int) -> Tuple[jax.Array, jax.Array]:
@@ -341,6 +363,7 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         obstacle_geom_names: tuple[str, ...] = (),
         obstacle_placement_frame: str = "environment",
         reference_mode: str = "tracking",
+        warp_obstacle_sensor_names: tuple[str, ...] = (),
     ):
         super().__init__(
             xml_path=consts.task_to_xml(terrain_type).as_posix(),
@@ -352,14 +375,40 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
             raise ValueError("reference_mode must be tracking or initialization_only")
         if obstacle_placement_frame not in ("environment", "initial_root_yaw"):
             raise ValueError("obstacle placement must be environment or initial_root_yaw")
-        if (obstacle_geom_names or reference_mode != "tracking") and mjx_impl(self._config) != "jax":
-            raise NotImplementedError("native physical scenes and held reference currently require MJX JAX")
+        impl = mjx_impl(self._config)
+        warp_candidate = (impl == "warp" and bool(obstacle_geom_names)
+                          and bool(warp_obstacle_sensor_names))
+        if (obstacle_geom_names or reference_mode != "tracking") and impl != "jax" and not warp_candidate:
+            raise NotImplementedError("native physical scenes and held reference require MJX JAX or explicit Warp mocap sensors")
+        if warp_obstacle_sensor_names and not warp_candidate:
+            raise ValueError("Warp obstacle sensor names require the explicit Warp obstacle scene")
         self.reference_mode = reference_mode
         self.obstacle_placement_frame = obstacle_placement_frame
         self.obstacle_geom_ids = tuple(int(self.mj_model.geom(name).id) for name in obstacle_geom_names)
-        if any(int(self.mj_model.geom_bodyid[i]) != 0 for i in self.obstacle_geom_ids):
-            raise ValueError("native per-world obstacles must be fixed world geoms")
-        self._obstacle_centers = jp.asarray(self.mj_model.geom_pos[list(self.obstacle_geom_ids)])
+        self._warp_obstacle_mode = "mocap_sensors" if warp_candidate else None
+        self._warp_pair_sensors = ()
+        self._obstacle_mocap_ids = ()
+        self._mocap_default_pos = None
+        if warp_candidate:
+            self._warp_pair_sensors = require_complete_pillar_coverage(
+                self.mj_model, obstacle_names=obstacle_geom_names,
+                sensor_names=warp_obstacle_sensor_names,
+                root_body_id=int(self.mj_model.body("pelvis").id))
+            body_ids = [int(self.mj_model.geom_bodyid[i]) for i in self.obstacle_geom_ids]
+            mocap_ids = tuple(int(self.mj_model.body_mocapid[i]) for i in body_ids)
+            if len(set(mocap_ids)) != len(mocap_ids):
+                raise ValueError("each Warp pillar requires its own mocap body")
+            self._obstacle_mocap_ids = mocap_ids
+            self._obstacle_centers = jp.asarray(self.mj_model.body_pos[body_ids])
+            mocap_body_ids = np.flatnonzero(np.asarray(self.mj_model.body_mocapid) >= 0)
+            mocap_defaults = np.empty((self.mj_model.nmocap, 3))
+            mocap_defaults[np.asarray(self.mj_model.body_mocapid)[mocap_body_ids]] = (
+                self.mj_model.body_pos[mocap_body_ids])
+            self._mocap_default_pos = jp.asarray(mocap_defaults)
+        else:
+            if any(int(self.mj_model.geom_bodyid[i]) != 0 for i in self.obstacle_geom_ids):
+                raise ValueError("native per-world JAX obstacles must be fixed world geoms")
+            self._obstacle_centers = jp.asarray(self.mj_model.geom_pos[list(self.obstacle_geom_ids)])
         self._post_init()
         if reference_mode == "initialization_only" and self._evaluation_physical_stop is None:
             raise ValueError("held reference requires explicit physical evaluation termination")
@@ -367,9 +416,13 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
     def model_for_centers(self, centers):
         if not self.obstacle_geom_ids:
             return self.mjx_model
+        if getattr(self, "_warp_obstacle_mode", None):
+            raise ValueError("Warp pillar centers belong to MjData.mocap_pos, not the model")
         return self.mjx_model.replace(geom_pos=self.mjx_model.geom_pos.at[jp.asarray(self.obstacle_geom_ids)].set(centers))
 
     def model_for_state(self, state):
+        if getattr(self, "_warp_obstacle_mode", None):
+            return self.mjx_model
         return self.model_for_centers(state.info.get("physical_obstacle_centers", self._obstacle_centers))
 
     def _place_obstacles(self, qpos):
@@ -594,10 +647,17 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         noisy_init_root_quat = math.quat_mul(yaw_noise_quat, init_traj_data.qpos[3:7])
         noisy_init_qpos = noisy_init_qpos.at[3:7].set(noisy_init_root_quat)
 
-        data = self._init_mjx_data(qpos=noisy_init_qpos, qvel=init_traj_data.qvel, ctrl=noisy_init_qpos[7:])
         if self.obstacle_geom_ids:
             obstacle_centers = self._place_obstacles(noisy_init_qpos) if obstacle_centers is None else obstacle_centers
-            data = mjx.forward(self.model_for_centers(obstacle_centers), data)
+        if self._warp_obstacle_mode:
+            mocap_pos = self._mocap_default_pos.at[jp.asarray(self._obstacle_mocap_ids)].set(obstacle_centers)
+            data = self._init_mjx_data(qpos=noisy_init_qpos, qvel=init_traj_data.qvel,
+                                       ctrl=noisy_init_qpos[7:], mocap_pos=mocap_pos)
+        else:
+            data = self._init_mjx_data(qpos=noisy_init_qpos, qvel=init_traj_data.qvel,
+                                       ctrl=noisy_init_qpos[7:])
+            if self.obstacle_geom_ids:
+                data = mjx.forward(self.model_for_centers(obstacle_centers), data)
 
         traj_no = carry.traj_state.traj_no
 
@@ -671,6 +731,10 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
 
     def step(self, state: mjx_env.State, action: jax.Array, trajectory_data: TrajectoryData = None) -> mjx_env.State:
         """Native training step, including its established automatic-reset policy."""
+        if self._warp_obstacle_mode:
+            raise NotImplementedError(
+                "Warp pillars require terminal-preserving step_no_autoreset "
+                "and an explicit batched reset_done after terminal readback")
         return self._step(state, action, trajectory_data, auto_reset=True)
 
     def step_no_autoreset(self, state: mjx_env.State, action: jax.Array,
@@ -693,8 +757,21 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         return self._step(state, action, trajectory_data, auto_reset=False, capture_contacts=True,
                           posture_termination_enabled=posture_termination_enabled)
 
+    def step_with_pillar_sensors(self, state: mjx_env.State, action: jax.Array,
+                                 trajectory_data: TrajectoryData = None,
+                                 posture_termination_enabled=None):
+        """Candidate terminal-preserving Warp step with per-substep pillar sensors."""
+        if self._warp_obstacle_mode != "mocap_sensors" or not self._warp_pair_sensors:
+            raise NotImplementedError("Warp pillar samples require the explicitly validated mocap scene")
+        return self._step(state, action, trajectory_data, auto_reset=False,
+                          capture_pillar_sensors=True,
+                          posture_termination_enabled=posture_termination_enabled)
+
     def _step(self, state: mjx_env.State, action: jax.Array, trajectory_data: TrajectoryData,
-              *, auto_reset: bool, capture_contacts: bool = False, posture_termination_enabled=None):
+              *, auto_reset: bool, capture_contacts: bool = False,
+              capture_pillar_sensors: bool = False, posture_termination_enabled=None):
+        if capture_contacts and capture_pillar_sensors:
+            raise ValueError("one control cannot select both native contact measurement modes")
         if posture_termination_enabled is not None and self._evaluation_physical_stop is None:
             raise ValueError("posture termination control requires the selected physical termination rule")
         if auto_reset and getattr(self, "_evaluation_physical_stop", None) is not None:
@@ -709,7 +786,13 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         traj_data = self.th.get_current_traj_data_with_trajectory(trajectory_data, state.info["traj_info"])
         motor_targets = self._get_motor_targets(state, action, use_residual_action=self._config.student_use_residual_action, trajectory_data=trajectory_data)
 
-        if capture_contacts:
+        if capture_pillar_sensors:
+            state.info["rng"], data, torque, samples = torque_step_with_pillar_sensors(
+                state.info["rng"], self.model_for_state(state), state.data,
+                motor_targets, kps=self._kps, kds=self._kds,
+                torque_limit=self.torque_limit, sensor_layout=self._warp_pair_sensors,
+                n_substeps=self.n_substeps)
+        elif capture_contacts:
             state.info["rng"], data, torque, samples = torque_step_with_contacts(
                 state.info["rng"],
                 self.model_for_state(state),
@@ -785,7 +868,7 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
 
         state = state.replace(data=data, obs=obs, reward=reward, done=done)
         if not auto_reset:
-            return (state, samples) if capture_contacts else state
+            return (state, samples) if (capture_contacts or capture_pillar_sensors) else state
         # Warp cannot call mjx.forward from this per-env reset branch once vmapped;
         # the DAgger wrapper resets done worlds after the vmap instead.
         if mjx_impl(self._config) == "warp" and "worldid" in state.info:
