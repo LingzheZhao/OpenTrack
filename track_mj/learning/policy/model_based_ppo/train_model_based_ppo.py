@@ -18,6 +18,7 @@ import optax
 
 from track_mj.learning.policy.ppo import acting_tracking
 from track_mj.learning.policy.ppo import metrics_aggregator as metric_logger
+from track_mj.learning.policy.jax_sharding import replicate_for_pmap
 from track_mj.learning.policy.model_based_ppo import model_based_ppo_networks as ppo_networks
 from track_mj.learning.policy.model_based_ppo import model_based_ppo_losses as ppo_losses
 
@@ -577,7 +578,7 @@ def train(
             {},
         )
 
-    training_state = jax.device_put_replicated(training_state, jax.local_devices()[:local_devices_to_use])
+    training_state = replicate_for_pmap(training_state, jax.local_devices()[:local_devices_to_use])
 
     training_metrics = {}
     training_walltime = 0

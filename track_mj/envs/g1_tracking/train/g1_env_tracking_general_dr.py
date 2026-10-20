@@ -415,7 +415,7 @@ class G1TrackingGeneralDREnv(g1_env_tracking_general.G1TrackingGeneralEnv):
         )
         rewards = self._get_reward(data, traj_data, action, motor_targets, torque, state.info)
         rewards = {k: v * rewards[k] for k, v in self._config.reward_config.scales.items()}
-        reward = jp.clip(sum(rewards.values()) * self.dt, a_max=10000.0)
+        reward = jp.clip(sum(rewards.values()) * self.dt, None, 10000.0)
 
         for k, v in rewards.items():
             state.metrics[f"reward/{k}"] = v

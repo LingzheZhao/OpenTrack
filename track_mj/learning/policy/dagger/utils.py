@@ -159,7 +159,7 @@ class TorchJaxEnv:
             mujoco.mjx.get_data_into(
                 self._mj_data,
                 self.mj_model,
-                jax.tree_map(lambda x: x[sim_id], mjx_data),
+                jax.tree_util.tree_map(lambda x: x[sim_id], mjx_data),
             )
             mujoco.mj_forward(self.mj_model, self._mj_data)
             self._viewer.sync()
