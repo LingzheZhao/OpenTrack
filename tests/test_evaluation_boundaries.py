@@ -82,6 +82,8 @@ def fake_native(family, residual, terminate, dr=False):
     env._default_qpos = jp.zeros(29)
     env._kps = env._kds = env.torque_limit = jp.ones(29)
     env._mjx_model = SimpleNamespace(nu=29)
+    if family == "g1_tracking_dagger":
+        env.obstacle_geom_ids, env._obstacle_centers, env.reference_mode = (), jp.zeros((0,3)), "tracking"
     env._ctrl_dt, env._sim_dt = .02, .002
     reference = SimpleNamespace(qpos=jp.concatenate([jp.zeros(7), jp.arange(29) / 10]))
     env.th = SimpleNamespace(get_current_traj_data_with_trajectory=lambda trajectory, carry: reference,
@@ -90,7 +92,7 @@ def fake_native(family, residual, terminate, dr=False):
     env._get_termination = lambda data, reference, info: jp.array(terminate)
     env._get_obs = lambda data, reference, info: ({"state": info["last_motor_targets"]}, jp.zeros(0))
 
-    def fresh(key, trajectory=None):
+    def fresh(key, trajectory=None, *, obstacle_centers=None):
         info = {"rng": key, "step": jp.array(0), "traj_no": jp.array(0),
                 "traj_info": Carry(TrajState(jp.array(0))), "truncation": jp.array(0.),
                 "last_motor_targets": jp.zeros(29), "last_action": jp.zeros(29), "last_root_pos": jp.zeros(3),
@@ -173,6 +175,13 @@ class EvaluationBoundaryTests(unittest.TestCase):
             np.testing.assert_array_equal(physical.xpos, jp.full((2, 1, 3), 10))
             np.testing.assert_array_equal(terminal.data.xpos, jp.zeros((2, 1, 3)))
             assert_tree_equal(self, pre, saved)
+            if family == "g1_tracking_dagger":
+                reset = vector.reset_done(terminal, object())
+                for original, continued in zip(jax.tree_util.tree_leaves(terminal), jax.tree_util.tree_leaves(reset)):
+                    np.testing.assert_array_equal(original[0], continued[0])
+                self.assertFalse(bool(reset.done[1]))
+                np.testing.assert_array_equal(reset.info['truncation'], [0., 0.])
+                self.assertFalse(np.array_equal(reset.info['rng'][1], terminal.info['rng'][1]))
 
     def test_physical_measurement_owns_its_array_storage(self):
         source = {"qpos": jp.ones((2, 3))}
@@ -180,6 +189,37 @@ class EvaluationBoundaryTests(unittest.TestCase):
         np.testing.assert_array_equal(owned["qpos"], source["qpos"])
         self.assertNotEqual(owned["qpos"].unsafe_buffer_pointer(), source["qpos"].unsafe_buffer_pointer())
         self.assertFalse(evaluation.contact_measurement()["available"])
+
+    def test_posture_control_precedes_native_done_counter_and_selective_reset(self):
+        env, _, _ = fake_native('g1_tracking_dagger', False, False)
+        env._evaluation_physical_stop = dict(root_link_height_min_m=.35, root_up_dot_min=.5, floor_height_w_m=0.)
+        env._get_termination = type(env)._get_termination.__get__(env)
+        vector = WRAPPERS['g1_tracking_dagger'].VmapWrapper(env)
+        pre = vector.reset(jax.random.split(jax.random.PRNGKey(5), 2), object())
+        pre = pre.replace(data=pre.data.replace(qpos=pre.data.qpos.at[:,2].set(.8)))
+        action = jp.zeros((2,29))
+        plain = vector.step_no_autoreset(pre, action, object())
+        enabled = vector.step_no_autoreset(pre, action, object(), jp.array(True))
+        assert_tree_equal(self, plain, enabled.replace(info={key:value for key,value in enabled.info.items()
+            if key != 'posture_termination'}))
+        mixed = pre.replace(data=pre.data.replace(qpos=pre.data.qpos.at[0,3:7].set(jp.array([0.,1.,0.,0.])),
+            qvel=pre.data.qvel.at[1,-1].set(jp.nan)))
+        terminal = vector.step_no_autoreset(mixed, action, object(), jp.array(False))
+        np.testing.assert_array_equal(terminal.done, [False, True])
+        np.testing.assert_array_equal(terminal.info['step'], [1,0])
+        self.assertTrue(bool(terminal.info['posture_termination']['tilt'][0]))
+        self.assertFalse(bool(terminal.info['posture_termination']['terminated'][0]))
+        reset = vector.reset_done(terminal, object())
+        for original, continued in zip(jax.tree_util.tree_leaves(terminal), jax.tree_util.tree_leaves(reset)):
+            np.testing.assert_array_equal(original[0], continued[0])
+        outside = vector.step_no_autoreset(reset, action, object(), jp.array(True))
+        self.assertTrue(bool(outside.done[0]))
+        self.assertEqual(int(outside.info['step'][0]), 0)
+        timeout = pre.replace(info={**pre.info,'step':jp.full((2,),env._config.episode_length-1)})
+        timed = vector.step_no_autoreset(timeout, action, object(), jp.array(False))
+        np.testing.assert_array_equal(timed.done, [True, True])
+        np.testing.assert_array_equal(timed.info['truncation'], [True, True])
+        np.testing.assert_array_equal(timed.info['posture_termination']['terminated'], [False, False])
 
 
 if __name__ == "__main__":

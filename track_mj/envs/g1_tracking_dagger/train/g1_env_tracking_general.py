@@ -193,7 +193,8 @@ class ContactSamples(NamedTuple):
     A control action stacks these leaves on its physics-substep axis. Forces
     belong to the solve at interval_start_s; interval_end_s is the advanced
     integration time. No endpoint forward is performed. Vectors are world-frame
-    newtons. A constraint slot can be present while its solved force is zero.
+    newtons. Active constraints satisfy native dist < includemargin; geometric
+    contact separately includes dist <= 0, even when solved force is zero.
     """
     interval_start_s: jax.Array
     interval_end_s: jax.Array
@@ -201,8 +202,14 @@ class ContactSamples(NamedTuple):
     normal_force_world_by_body_n: jax.Array
     geom: jax.Array
     constraint_present: jax.Array
+    contact_found: jax.Array
+    distance_m: jax.Array
+    inclusion_margin_m: jax.Array
     normal_n: jax.Array
     total_force_world_n: jax.Array
+    ground_normal_force_world_by_body_n: jax.Array
+    ground_total_force_world_by_body_n: jax.Array
+    ground_contact_found_by_body: jax.Array
 
 
 def _require_contact_backend(model, data):
@@ -223,7 +230,11 @@ def _solved_contact_sample(model, data, interval_start):
               for index, address in enumerate(contact.efc_address)]
     forces = jp.stack(forces) if forces else jp.zeros((0, 6), dtype=data.qvel.dtype)
     geom = contact.geom
-    present = (jp.asarray(contact.efc_address) >= 0) & jp.all(geom >= 0, axis=-1)
+    valid = (jp.asarray(contact.efc_address) >= 0) & jp.all(geom >= 0, axis=-1)
+    # Match the native JAX constraint builder's strict activation boundary.
+    # Margin can activate a separated pair; it is not geometric touching.
+    present = valid & (contact.dist < contact.includemargin)
+    contact_found = valid & (contact.dist <= 0)
     world_force = jax.vmap(lambda force, frame: force[:3] @ frame)(forces, contact.frame)
     total = jp.where(present[:, None], world_force, 0.)
     normal_n = jp.where(present, forces[:, 0], 0.)
@@ -236,8 +247,18 @@ def _solved_contact_sample(model, data, interval_start):
         result = result.at[bodies[:, 0]].add(-values)
         return result.at[bodies[:, 1]].add(values)
 
+    # A plane is the explicitly supported ground source, never robot self-contact.
+    plane = jp.asarray(model.geom_type) == int(mujoco.mjtGeom.mjGEOM_PLANE)
+    ground = present & jp.any(plane[jp.maximum(geom, 0)], axis=-1)
+    ground_normal = body_sum(jp.where(ground[:, None], normal, 0.))
+    ground_total = body_sum(jp.where(ground[:, None], total, 0.))
+    ground_touch = contact_found & jp.any(plane[jp.maximum(geom, 0)], axis=-1)
+    found = jp.zeros((model.nbody,), dtype=jp.int32)
+    found = found.at[bodies[:, 0]].add(ground_touch.astype(jp.int32))
+    found = found.at[bodies[:, 1]].add(ground_touch.astype(jp.int32))
     return ContactSamples(interval_start, data.time, body_sum(total), body_sum(normal),
-                          geom, present, normal_n, total)
+                          geom, present, contact_found, contact.dist, contact.includemargin,
+                          normal_n, total, ground_normal, ground_total, found > 0)
 
 
 def _torque_step(
@@ -316,13 +337,58 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         terrain_type: str = "flat_terrain",
         config: config_dict.ConfigDict = None,
         config_overrides: Optional[Dict[str, Union[str, int, list[Any]]]] = None,
+        *, model_spec: Optional[mujoco.MjSpec] = None,
+        obstacle_geom_names: tuple[str, ...] = (),
+        obstacle_placement_frame: str = "environment",
+        reference_mode: str = "tracking",
     ):
         super().__init__(
             xml_path=consts.task_to_xml(terrain_type).as_posix(),
             config=config,
             config_overrides=config_overrides,
+            model_spec=model_spec,
         )
+        if reference_mode not in ("tracking", "initialization_only"):
+            raise ValueError("reference_mode must be tracking or initialization_only")
+        if obstacle_placement_frame not in ("environment", "initial_root_yaw"):
+            raise ValueError("obstacle placement must be environment or initial_root_yaw")
+        if (obstacle_geom_names or reference_mode != "tracking") and mjx_impl(self._config) != "jax":
+            raise NotImplementedError("native physical scenes and held reference currently require MJX JAX")
+        self.reference_mode = reference_mode
+        self.obstacle_placement_frame = obstacle_placement_frame
+        self.obstacle_geom_ids = tuple(int(self.mj_model.geom(name).id) for name in obstacle_geom_names)
+        if any(int(self.mj_model.geom_bodyid[i]) != 0 for i in self.obstacle_geom_ids):
+            raise ValueError("native per-world obstacles must be fixed world geoms")
+        self._obstacle_centers = jp.asarray(self.mj_model.geom_pos[list(self.obstacle_geom_ids)])
         self._post_init()
+        if reference_mode == "initialization_only" and self._evaluation_physical_stop is None:
+            raise ValueError("held reference requires explicit physical evaluation termination")
+
+    def model_for_centers(self, centers):
+        if not self.obstacle_geom_ids:
+            return self.mjx_model
+        return self.mjx_model.replace(geom_pos=self.mjx_model.geom_pos.at[jp.asarray(self.obstacle_geom_ids)].set(centers))
+
+    def model_for_state(self, state):
+        return self.model_for_centers(state.info.get("physical_obstacle_centers", self._obstacle_centers))
+
+    def _place_obstacles(self, qpos):
+        centers = self._obstacle_centers
+        if self.obstacle_placement_frame == "initial_root_yaw":
+            # Only yaw and xy placement: z stays the declared world-floor height.
+            q = qpos[3:7]
+            yaw = jp.arctan2(2 * (q[0]*q[3] + q[1]*q[2]), 1 - 2*(q[2]**2 + q[3]**2))
+            c, sn = jp.cos(yaw), jp.sin(yaw)
+            x, y = centers[:, 0], centers[:, 1]
+            centers = centers.at[:, 0].set(c*x-sn*y+qpos[0]).at[:, 1].set(sn*x+c*y+qpos[1])
+        return centers
+
+    def _advance_reference(self, trajectory_data, carry):
+        if self.reference_mode == "tracking":
+            return self.th.update_state_with_trajectory(trajectory_data, carry)
+        state = carry.traj_state
+        length = trajectory_data.split_points[state.traj_no+1] - trajectory_data.split_points[state.traj_no]
+        return carry.replace(traj_state=state.replace(subtraj_step_no=jp.minimum(state.subtraj_step_no+1, length-1)))
 
     def _post_init(self) -> None:
         self.num_joints = self.mjx_model.nq - 7
@@ -475,7 +541,9 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         return None if settings is None else {**settings, "mode": "walking_physical_v1",
             "root_position_point": "pelvis_link_origin", "quaternion_order": "WXYZ",
             "height_frame": "world_above_declared_floor", "up_axis": "pelvis_local_z_dot_world_z",
-            "truncation": "native_episode_horizon_only; reference clock still advances",
+            "truncation": "native_episode_horizon_only",
+            "reference_end": ("hold_final_row_without_physical_reset"
+                if getattr(self, "reference_mode", "tracking") == "initialization_only" else "native_advance_and_wrap"),
             "interpretation": "bounded walking diagnostic safeguard, not a general physical-fall classifier"}
 
     def _physical_stop_flags(self, data):
@@ -491,7 +559,14 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
                           | ~jp.isfinite(height) | ~jp.isfinite(up_dot)),
             "invalid_quaternion": norm2 <= 0}
 
-    def reset(self, rng: jax.Array, trajectory_data: TrajectoryData = None) -> mjx_env.State:
+    def posture_termination(self, flags, enabled):
+        """Apply task posture applicability without suppressing numerical failure."""
+        enabled = jp.asarray(enabled, dtype=jp.bool_)
+        terminated = ((flags["height"] | flags["tilt"]) & enabled
+                      | flags["nonfinite"] | flags["invalid_quaternion"])
+        return {**flags, "enabled": enabled, "terminated": terminated}
+
+    def reset(self, rng: jax.Array, trajectory_data: TrajectoryData = None, *, obstacle_centers=None) -> mjx_env.State:
         # only use key to choose a new start
         if trajectory_data is None:
             trajectory_data = self.th.traj.data
@@ -520,11 +595,14 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         noisy_init_qpos = noisy_init_qpos.at[3:7].set(noisy_init_root_quat)
 
         data = self._init_mjx_data(qpos=noisy_init_qpos, qvel=init_traj_data.qvel, ctrl=noisy_init_qpos[7:])
+        if self.obstacle_geom_ids:
+            obstacle_centers = self._place_obstacles(noisy_init_qpos) if obstacle_centers is None else obstacle_centers
+            data = mjx.forward(self.model_for_centers(obstacle_centers), data)
 
         traj_no = carry.traj_state.traj_no
 
         # update to get the reference trajectory step
-        carry = self.th.update_state_with_trajectory(trajectory_data, carry)
+        carry = self._advance_reference(trajectory_data, carry)
         traj_data = self.th.get_current_traj_data_with_trajectory(trajectory_data, carry)
 
         rng = carry.key
@@ -546,6 +624,8 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
             "traj_info": carry,
         }
 
+        if self.obstacle_geom_ids:
+            info["physical_obstacle_centers"] = obstacle_centers
         if self._evaluation_physical_stop is not None:
             info["evaluation_physical_stop"] = self._physical_stop_flags(data)
 
@@ -594,12 +674,15 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         return self._step(state, action, trajectory_data, auto_reset=True)
 
     def step_no_autoreset(self, state: mjx_env.State, action: jax.Array,
-                          trajectory_data: TrajectoryData = None) -> mjx_env.State:
+                          trajectory_data: TrajectoryData = None,
+                          posture_termination_enabled=None) -> mjx_env.State:
         """The same physical advance and observations, retaining the terminal state."""
-        return self._step(state, action, trajectory_data, auto_reset=False)
+        return self._step(state, action, trajectory_data, auto_reset=False,
+                          posture_termination_enabled=posture_termination_enabled)
 
     def step_with_contacts(self, state: mjx_env.State, action: jax.Array,
-                           trajectory_data: TrajectoryData = None):
+                           trajectory_data: TrajectoryData = None,
+                           posture_termination_enabled=None):
         """Advance without autoreset; return terminal state and 500 Hz solved forces.
 
         This explicit measurement path supports native JAX Euler only. Body
@@ -607,10 +690,13 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         implied. Instrumented numerical neutrality needs native validation.
         """
         _require_contact_backend(self.mjx_model, state.data)
-        return self._step(state, action, trajectory_data, auto_reset=False, capture_contacts=True)
+        return self._step(state, action, trajectory_data, auto_reset=False, capture_contacts=True,
+                          posture_termination_enabled=posture_termination_enabled)
 
     def _step(self, state: mjx_env.State, action: jax.Array, trajectory_data: TrajectoryData,
-              *, auto_reset: bool, capture_contacts: bool = False):
+              *, auto_reset: bool, capture_contacts: bool = False, posture_termination_enabled=None):
+        if posture_termination_enabled is not None and self._evaluation_physical_stop is None:
+            raise ValueError("posture termination control requires the selected physical termination rule")
         if auto_reset and getattr(self, "_evaluation_physical_stop", None) is not None:
             raise ValueError("physical evaluation uses terminal-preserving steps, never training autoreset")
         if not auto_reset:
@@ -626,7 +712,7 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         if capture_contacts:
             state.info["rng"], data, torque, samples = torque_step_with_contacts(
                 state.info["rng"],
-                self.mjx_model,
+                self.model_for_state(state),
                 state.data,
                 motor_targets,
                 kps=self._kps,
@@ -637,7 +723,7 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         else:
             state.info["rng"], data, torque = torque_step(
                 state.info["rng"],
-                self.mjx_model,
+                self.model_for_state(state),
                 state.data,
                 motor_targets,
                 kps=self._kps,
@@ -666,12 +752,14 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         state.info["last_joint_vel"] = data.qvel[6:].copy()
 
         # get termination
-        termination = self._get_termination(data, traj_data, state.info)
+        termination = (self._get_termination(data, traj_data, state.info)
+                       if posture_termination_enabled is None else
+                       self._get_termination(data, traj_data, state.info, posture_termination_enabled))
         if getattr(self, "_evaluation_physical_stop", None) is not None:
             state.info["evaluation_physical_stop"] = self._physical_stop_flags(data)
 
         # reference trajectory step
-        state.info["traj_info"] = self.th.update_state_with_trajectory(trajectory_data, state.info["traj_info"])
+        state.info["traj_info"] = self._advance_reference(trajectory_data, state.info["traj_info"])
         traj_data = self.th.get_current_traj_data_with_trajectory(trajectory_data, state.info["traj_info"])
 
         # get truncated conditions
@@ -919,9 +1007,14 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
             del self._viewer
             self._viewer = None
 
-    def _get_termination(self, data: mjx.Data, traj_data: TrajectoryData, info: dict[str, Any]) -> jax.Array:
+    def _get_termination(self, data: mjx.Data, traj_data: TrajectoryData, info: dict[str, Any],
+                         posture_termination_enabled=None) -> jax.Array:
         if getattr(self, "_evaluation_physical_stop", None) is not None:
             flags = self._physical_stop_flags(data)
+            if posture_termination_enabled is not None or "posture_termination" in info:
+                info["posture_termination"] = self.posture_termination(flags,
+                    True if posture_termination_enabled is None else posture_termination_enabled)
+                return info["posture_termination"]["terminated"]
             return flags["height"] | flags["tilt"] | flags["nonfinite"] | flags["invalid_quaternion"]
         fall_termination = jp.abs(data.qpos[2] - traj_data.qpos[2]) > self._config.termination_config.root_height_threshold
 
