@@ -193,7 +193,8 @@ class ContactSamples(NamedTuple):
     A control action stacks these leaves on its physics-substep axis. Forces
     belong to the solve at interval_start_s; interval_end_s is the advanced
     integration time. No endpoint forward is performed. Vectors are world-frame
-    newtons. A constraint slot can be present while its solved force is zero.
+    newtons. Active constraints satisfy native dist < includemargin; geometric
+    contact separately includes dist <= 0, even when solved force is zero.
     """
     interval_start_s: jax.Array
     interval_end_s: jax.Array
@@ -201,6 +202,9 @@ class ContactSamples(NamedTuple):
     normal_force_world_by_body_n: jax.Array
     geom: jax.Array
     constraint_present: jax.Array
+    contact_found: jax.Array
+    distance_m: jax.Array
+    inclusion_margin_m: jax.Array
     normal_n: jax.Array
     total_force_world_n: jax.Array
     ground_normal_force_world_by_body_n: jax.Array
@@ -226,7 +230,11 @@ def _solved_contact_sample(model, data, interval_start):
               for index, address in enumerate(contact.efc_address)]
     forces = jp.stack(forces) if forces else jp.zeros((0, 6), dtype=data.qvel.dtype)
     geom = contact.geom
-    present = (jp.asarray(contact.efc_address) >= 0) & jp.all(geom >= 0, axis=-1)
+    valid = (jp.asarray(contact.efc_address) >= 0) & jp.all(geom >= 0, axis=-1)
+    # Match the native JAX constraint builder's strict activation boundary.
+    # Margin can activate a separated pair; it is not geometric touching.
+    present = valid & (contact.dist < contact.includemargin)
+    contact_found = valid & (contact.dist <= 0)
     world_force = jax.vmap(lambda force, frame: force[:3] @ frame)(forces, contact.frame)
     total = jp.where(present[:, None], world_force, 0.)
     normal_n = jp.where(present, forces[:, 0], 0.)
@@ -244,11 +252,13 @@ def _solved_contact_sample(model, data, interval_start):
     ground = present & jp.any(plane[jp.maximum(geom, 0)], axis=-1)
     ground_normal = body_sum(jp.where(ground[:, None], normal, 0.))
     ground_total = body_sum(jp.where(ground[:, None], total, 0.))
+    ground_touch = contact_found & jp.any(plane[jp.maximum(geom, 0)], axis=-1)
     found = jp.zeros((model.nbody,), dtype=jp.int32)
-    found = found.at[bodies[:, 0]].add(ground.astype(jp.int32))
-    found = found.at[bodies[:, 1]].add(ground.astype(jp.int32))
+    found = found.at[bodies[:, 0]].add(ground_touch.astype(jp.int32))
+    found = found.at[bodies[:, 1]].add(ground_touch.astype(jp.int32))
     return ContactSamples(interval_start, data.time, body_sum(total), body_sum(normal),
-                          geom, present, normal_n, total, ground_normal, ground_total, found > 0)
+                          geom, present, contact_found, contact.dist, contact.includemargin,
+                          normal_n, total, ground_normal, ground_total, found > 0)
 
 
 def _torque_step(
