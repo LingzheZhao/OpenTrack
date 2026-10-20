@@ -731,7 +731,7 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
 
     def step(self, state: mjx_env.State, action: jax.Array, trajectory_data: TrajectoryData = None) -> mjx_env.State:
         """Native training step, including its established automatic-reset policy."""
-        if self._warp_obstacle_mode:
+        if getattr(self, "_warp_obstacle_mode", None):
             raise NotImplementedError(
                 "Warp pillars require terminal-preserving step_no_autoreset "
                 "and an explicit batched reset_done after terminal readback")
