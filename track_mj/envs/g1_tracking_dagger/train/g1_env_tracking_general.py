@@ -416,12 +416,12 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
     def model_for_centers(self, centers):
         if not self.obstacle_geom_ids:
             return self.mjx_model
-        if getattr(self, "_warp_obstacle_mode", None):
+        if self._warp_obstacle_mode:
             raise ValueError("Warp pillar centers belong to MjData.mocap_pos, not the model")
         return self.mjx_model.replace(geom_pos=self.mjx_model.geom_pos.at[jp.asarray(self.obstacle_geom_ids)].set(centers))
 
     def model_for_state(self, state):
-        if getattr(self, "_warp_obstacle_mode", None):
+        if self._warp_obstacle_mode:
             return self.mjx_model
         return self.model_for_centers(state.info.get("physical_obstacle_centers", self._obstacle_centers))
 
@@ -731,7 +731,7 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
 
     def step(self, state: mjx_env.State, action: jax.Array, trajectory_data: TrajectoryData = None) -> mjx_env.State:
         """Native training step, including its established automatic-reset policy."""
-        if getattr(self, "_warp_obstacle_mode", None):
+        if self._warp_obstacle_mode:
             raise NotImplementedError(
                 "Warp pillars require terminal-preserving step_no_autoreset "
                 "and an explicit batched reset_done after terminal readback")

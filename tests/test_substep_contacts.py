@@ -159,6 +159,7 @@ class SubstepContactTests(unittest.TestCase):
                                      episode_length=100, reward_config=SimpleNamespace(scales={'x': 1.}))
         env.mjx_model = MODEL
         env.obstacle_geom_ids, env._obstacle_centers, env.reference_mode = (), jp.zeros((0,3)), "tracking"
+        env._warp_obstacle_mode = None
         env.action_joint_ids = jp.arange(29)
         env._default_qpos = jp.zeros(29)
         env._kps = env._kds = env.torque_limit = jp.ones(29)

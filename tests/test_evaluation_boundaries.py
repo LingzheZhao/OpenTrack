@@ -84,6 +84,7 @@ def fake_native(family, residual, terminate, dr=False):
     env._mjx_model = SimpleNamespace(nu=29)
     if family == "g1_tracking_dagger":
         env.obstacle_geom_ids, env._obstacle_centers, env.reference_mode = (), jp.zeros((0,3)), "tracking"
+        env._warp_obstacle_mode = None
     env._ctrl_dt, env._sim_dt = .02, .002
     reference = SimpleNamespace(qpos=jp.concatenate([jp.zeros(7), jp.arange(29) / 10]))
     env.th = SimpleNamespace(get_current_traj_data_with_trajectory=lambda trajectory, carry: reference,
