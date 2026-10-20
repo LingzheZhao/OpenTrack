@@ -193,7 +193,9 @@ def run(motion_path: Path, config_path: Path, controls: int = 8,
             "pre_time_s": pre_time.tolist(),
             "post_time_s": np.asarray(measured.data.time).tolist(),
             "terminal_before_reset": np.asarray(measured.done).tolist(),
-            "pillar_contact_substeps": (found > 0).any(axis=2).sum(axis=1).tolist(),
+            "pair_found_substeps": (found > 0).any(axis=2).sum(axis=1).tolist(),
+            "geometric_contact_substeps":
+                np.asarray(substeps.pair_geometric_contact).any(axis=2).sum(axis=1).tolist(),
             "max_pillar_normal_force_n": normal.max(axis=(1, 2)).tolist()})
         state = measured
         if control == controls // 2 - 1:
@@ -220,7 +222,7 @@ def run(motion_path: Path, config_path: Path, controls: int = 8,
             state = after
     if result["steps"][0]["max_pillar_normal_force_n"][0] <= 0:
         raise AssertionError("touching world did not produce a solved pillar normal force")
-    if any(step["pillar_contact_substeps"][1] for step in result["steps"]):
+    if any(step["pair_found_substeps"][1] for step in result["steps"]):
         raise AssertionError("clear world acquired a pillar contact")
     return result
 

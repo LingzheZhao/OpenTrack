@@ -203,8 +203,10 @@ def run(args, output):
                             "overflow_codes": np.asarray(sensed.overflow_code).tolist(),
                             "sensor_invalid_any": bool(np.any(sensed.pair_sensor_invalid)),
                             "invalid_any": bool(np.any(sensed.invalid)),
-                            "pillar_contact_substeps":
+                            "pair_found_substeps":
                                 (np.asarray(sensed.pair_found_count) > 0).any(axis=2).sum(axis=1).tolist(),
+                            "geometric_contact_substeps":
+                                np.asarray(sensed.pair_geometric_contact).any(axis=2).sum(axis=1).tolist(),
                             "max_individual_contact_normal_n":
                                 np.asarray(sensed.pair_max_normal_force_n).max(axis=(1, 2)).tolist(),
                             "pre_time_s": np.asarray(sensed.interval_start_s)[:, 0].tolist(),
