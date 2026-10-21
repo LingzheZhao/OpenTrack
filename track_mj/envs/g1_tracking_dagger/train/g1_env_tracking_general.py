@@ -613,9 +613,9 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
             "invalid_quaternion": norm2 <= 0}
 
     def posture_termination(self, flags, enabled):
-        """Apply task posture applicability without suppressing numerical failure."""
+        """Grace only tilt; low height and numerical failures always stop."""
         enabled = jp.asarray(enabled, dtype=jp.bool_)
-        terminated = ((flags["height"] | flags["tilt"]) & enabled
+        terminated = (flags["height"] | (flags["tilt"] & enabled)
                       | flags["nonfinite"] | flags["invalid_quaternion"])
         return {**flags, "enabled": enabled, "terminated": terminated}
 
