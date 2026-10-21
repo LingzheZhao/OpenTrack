@@ -68,10 +68,19 @@ class VmapWrapper(Wrapper):
         super().__init__(env)
         self.batch_size = batch_size
 
-    def reset(self, rng: jax.Array, trajectory_data) -> State:
+    def reset(self, rng: jax.Array, trajectory_data, obstacle_centers=None) -> State:
         if self.batch_size is not None:
             rng = jax.random.split(rng, self.batch_size)
-        state = jax.vmap(self.env.reset, in_axes=(0, None), axis_name=MJX_WORLD_AXIS_NAME)(rng, trajectory_data)
+        if obstacle_centers is None:
+            state = jax.vmap(self.env.reset, in_axes=(0, None), axis_name=MJX_WORLD_AXIS_NAME)(rng, trajectory_data)
+        else:
+            if getattr(self.env, '_warp_obstacle_mode', None) != 'mocap_sensors':
+                raise ValueError('explicit per-world centers require the native Warp mocap obstacle scene')
+            if obstacle_centers.shape != (rng.shape[0], len(self.env.obstacle_geom_ids), 3):
+                raise ValueError('obstacle centers must be [worlds, native obstacles, xyz]')
+            state = jax.vmap(lambda key, centers: self.env.reset(
+                key, trajectory_data, obstacle_centers=centers),
+                in_axes=(0, 0), axis_name=MJX_WORLD_AXIS_NAME)(rng, obstacle_centers)
         return _annotate_worldid(state)
 
     def initialize_physical_start(self, state: State, trajectory_data,

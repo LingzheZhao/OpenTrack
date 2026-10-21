@@ -31,6 +31,28 @@ def model_with_sensor(slots=4):
 
 
 class WarpPillarCandidateTests(unittest.TestCase):
+    def test_vector_reset_owns_explicit_centers_per_world(self):
+        from mujoco_playground._src.mjx_env import State
+        from track_mj.envs.g1_tracking_dagger.utils.wrapper import VmapWrapper
+
+        class TinyEnv:
+            _warp_obstacle_mode = 'mocap_sensors'
+            obstacle_geom_ids = (3, 4)
+
+            def reset(self, key, trajectory_data, *, obstacle_centers=None):
+                del key, trajectory_data
+                return State(data=obstacle_centers, obs={}, reward=jp.array(0.),
+                             done=jp.array(False), metrics={}, info={})
+
+        env = VmapWrapper(TinyEnv())
+        keys = jax.random.split(jax.random.PRNGKey(3), 2)
+        centers = jp.array([[[0.,0.,.5],[1.,0.,.5]], [[3.,0.,.5],[4.,0.,.5]]])
+        state = jax.jit(env.reset)(keys, None, centers)
+        np.testing.assert_array_equal(state.data, centers)
+        np.testing.assert_array_equal(state.info['worldid'], [0,1])
+        with self.assertRaisesRegex(ValueError, 'centers must be'):
+            env.reset(keys, None, centers[:1])
+
     def test_exact_mocap_sphere_uses_the_same_complete_pair_contract(self):
         spec = mujoco.MjSpec.from_string('''<mujoco model="sphere probe"><worldbody>
             <body name="robot" pos="0 0 .8"><freejoint/>
