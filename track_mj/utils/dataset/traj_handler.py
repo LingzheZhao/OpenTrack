@@ -161,12 +161,12 @@ class TrajectoryHandler(StatefulObject):
             j_type = model.jnt_type[i]
             joint_names.append(name)
 
-            if j_type == mujoco.mjtJoint.mjJNT_FREE:
+            if j_type == int(mujoco.mjtJoint.mjJNT_FREE):
                 joint_name2id_qpos[name] = jnp.arange(j_qpos, j_qpos + 7)
                 joint_name2id_qvel[name] = jnp.arange(j_qvel, j_qvel + 6)
                 j_qpos += 7
                 j_qvel += 6
-            elif j_type == mujoco.mjtJoint.mjJNT_SLIDE or j_type == mujoco.mjtJoint.mjJNT_HINGE:
+            elif j_type == int(mujoco.mjtJoint.mjJNT_SLIDE) or j_type == int(mujoco.mjtJoint.mjJNT_HINGE):
                 joint_name2id_qpos[name] = jnp.array([j_qpos])
                 joint_name2id_qvel[name] = jnp.array([j_qvel])
                 j_qpos += 1

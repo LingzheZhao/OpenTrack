@@ -134,12 +134,12 @@ class TrajectoryInfo:
         j_qvel = 0
         for i, item in enumerate(zip(self.joint_names, self.model.jnt_type)):
             j_name, j_type = item
-            if j_type == mujoco.mjtJoint.mjJNT_FREE:
+            if j_type == int(mujoco.mjtJoint.mjJNT_FREE):
                 self.joint_name2ind_qpos[j_name] = np.arange(j_qpos, j_qpos + 7)
                 self.joint_name2ind_qvel[j_name] = np.arange(j_qvel, j_qvel + 6)
                 j_qpos += 7
                 j_qvel += 6
-            elif j_type == mujoco.mjtJoint.mjJNT_SLIDE or j_type == mujoco.mjtJoint.mjJNT_HINGE:
+            elif j_type == int(mujoco.mjtJoint.mjJNT_SLIDE) or j_type == int(mujoco.mjtJoint.mjJNT_HINGE):
                 self.joint_name2ind_qpos[j_name] = np.array([j_qpos])
                 self.joint_name2ind_qvel[j_name] = np.array([j_qvel])
                 j_qpos += 1

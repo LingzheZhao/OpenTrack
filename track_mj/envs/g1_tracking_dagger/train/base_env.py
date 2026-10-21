@@ -35,10 +35,11 @@ class G1Env(mjx_env.MjxEnv):
         xml_path: str,
         config: config_dict.ConfigDict,
         config_overrides: Optional[Dict[str, Union[str, int, list[Any]]]] = None,
+        model_spec: Optional[mujoco.MjSpec] = None,
     ) -> None:
         super().__init__(config, config_overrides)
 
-        self._mj_model = mujoco.MjModel.from_xml_path(xml_path)
+        self._mj_model = (mujoco.MjModel.from_xml_path(xml_path) if model_spec is None else model_spec.compile())
         self._mj_model.opt.timestep = self.sim_dt
 
         self._mj_model.vis.global_.offwidth = 3840

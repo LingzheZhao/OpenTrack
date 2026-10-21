@@ -7,6 +7,7 @@ import mujoco.mjx as mjx
 from brax.envs.base import Env, State, Wrapper
 from mujoco_playground._src import mjx_env, wrapper
 from track_mj.utils.mjx_backend import MJX_WORLD_AXIS_NAME, mjx_impl
+from track_mj.utils.warp_obstacles import select_warp_reset_data_and_forward
 from track_mj.envs.evaluation import owned_data
 
 
@@ -67,11 +68,34 @@ class VmapWrapper(Wrapper):
         super().__init__(env)
         self.batch_size = batch_size
 
-    def reset(self, rng: jax.Array, trajectory_data) -> State:
+    def reset(self, rng: jax.Array, trajectory_data, obstacle_centers=None) -> State:
         if self.batch_size is not None:
             rng = jax.random.split(rng, self.batch_size)
-        state = jax.vmap(self.env.reset, in_axes=(0, None), axis_name=MJX_WORLD_AXIS_NAME)(rng, trajectory_data)
+        if obstacle_centers is None:
+            state = jax.vmap(self.env.reset, in_axes=(0, None), axis_name=MJX_WORLD_AXIS_NAME)(rng, trajectory_data)
+        else:
+            if getattr(self.env, '_warp_obstacle_mode', None) != 'mocap_sensors':
+                raise ValueError('explicit per-world centers require the native Warp mocap obstacle scene')
+            if obstacle_centers.shape != (rng.shape[0], len(self.env.obstacle_geom_ids), 3):
+                raise ValueError('obstacle centers must be [worlds, native obstacles, xyz]')
+            state = jax.vmap(lambda key, centers: self.env.reset(
+                key, trajectory_data, obstacle_centers=centers),
+                in_axes=(0, 0), axis_name=MJX_WORLD_AXIS_NAME)(rng, obstacle_centers)
         return _annotate_worldid(state)
+
+    def initialize_physical_start(self, state: State, trajectory_data,
+                                  root_link_pose_w, root_link_velocity_w,
+                                  joint_position, joint_velocity) -> State:
+        """Apply one explicit physical PRE state per already-reset world."""
+        worlds = state.done.shape[0]
+        expected = ((worlds, 7), (worlds, 6),
+                    (worlds, self.env.num_joints), (worlds, self.env.num_joints))
+        values = (root_link_pose_w, root_link_velocity_w, joint_position, joint_velocity)
+        if any(value.shape != shape for value, shape in zip(values, expected)):
+            raise ValueError("physical start requires [worlds,7/6/native joints/native joints] arrays")
+        return jax.vmap(self.env.initialize_physical_start,
+                        in_axes=(0, None, 0, 0, 0, 0),
+                        axis_name=MJX_WORLD_AXIS_NAME)(state, trajectory_data, *values)
 
     def step(self, state: State, action: jax.Array, trajectory_data) -> State:
         state = jax.vmap(self.env.step, in_axes=(0, 0, None), axis_name=MJX_WORLD_AXIS_NAME)(
@@ -100,17 +124,87 @@ class VmapWrapper(Wrapper):
             state, action, use_residual_action, trajectory_data
         )
 
-    def step_no_autoreset(self, state: State, action: jax.Array, trajectory_data=None) -> State:
+    def step_no_autoreset(self, state: State, action: jax.Array, trajectory_data=None,
+                          posture_termination_enabled=None) -> State:
         """Vectorize the native terminal-preserving physical step."""
+        if posture_termination_enabled is not None:
+            return jax.vmap(self.env.step_no_autoreset, in_axes=(0, 0, None, None), axis_name=MJX_WORLD_AXIS_NAME)(
+                state, action, trajectory_data, posture_termination_enabled)
         return jax.vmap(self.env.step_no_autoreset, in_axes=(0, 0, None), axis_name=MJX_WORLD_AXIS_NAME)(
             state, action, trajectory_data
         )
 
+    def reset_done(self, state: State, trajectory_data) -> State:
+        """Reset actual done worlds; retain all unselected state and key leaves."""
+        if getattr(self.env, "_warp_obstacle_mode", None) == "mocap_sensors":
+            done = state.done.astype(bool)
+
+            def fresh_world(world):
+                key, _ = jax.random.split(world.info["rng"])
+                reset = self.env.reset(key, trajectory_data,
+                    obstacle_centers=world.info["physical_obstacle_centers"])
+                info = {**world.info, **reset.info}
+                if "truncation" in info:
+                    info["truncation"] = jp.zeros_like(info["truncation"])
+                return reset.replace(info=info)
+
+            fresh = jax.vmap(fresh_world, axis_name=MJX_WORLD_AXIS_NAME)(state)
+            data = select_warp_reset_data_and_forward(
+                self.env.mjx_model, state.data, fresh.data, done)
+
+            def select(reset_value, live_value):
+                if not hasattr(live_value, "shape"):
+                    if reset_value != live_value:
+                        raise ValueError("non-array Warp reset state cannot vary by world")
+                    return live_value
+                if live_value.shape[:1] != done.shape or reset_value.shape != live_value.shape:
+                    raise ValueError("Warp reset state must keep one owned value per world")
+                mask = done.reshape(done.shape + (1,) * (live_value.ndim - 1))
+                return jp.where(mask, reset_value, live_value)
+
+            return state.replace(
+                data=data,
+                obs=jax.tree_util.tree_map(select, fresh.obs, state.obs),
+                reward=select(fresh.reward, state.reward),
+                done=select(fresh.done, state.done),
+                metrics=jax.tree_util.tree_map(select, fresh.metrics, state.metrics),
+                info=jax.tree_util.tree_map(select, fresh.info, state.info),
+            )
+
+        def reset_one(world):
+            key, _ = jax.random.split(world.info["rng"])
+            reset = self.env.reset(key, trajectory_data,
+                obstacle_centers=world.info.get("physical_obstacle_centers"))
+            # Vector-only annotations are not part of the scalar native reset.
+            info = {**world.info, **reset.info}
+            if "truncation" in info:
+                info["truncation"] = jp.zeros_like(info["truncation"])
+            reset = reset.replace(info=info)
+            return jax.tree_util.tree_map(lambda r, v: jp.where(world.done.astype(bool), r, v), reset, world)
+        return jax.vmap(reset_one, axis_name=MJX_WORLD_AXIS_NAME)(state)
+
+    def push_root_velocity(self, state: State, delta_xy_world):
+        """Change free-root translation velocity, retaining angular/joint state and policy cache."""
+        def apply(world, delta):
+            model = self.env.model_for_state(world)
+            before_data = mjx.forward(model, owned_data(world.data))
+            root = self.env.body_id_pelvis
+            def com_velocity(data):
+                angular = data.cvel[root, :3]
+                return data.cvel[root, 3:] + jp.cross(angular,
+                    data.xipos[root] - data.subtree_com[model.body_rootid[root]])
+            before = com_velocity(before_data)
+            data = world.data.replace(qvel=world.data.qvel.at[:2].add(delta))
+            data = mjx.forward(model, data)
+            return world.replace(data=data), before, com_velocity(data)
+        return jax.vmap(apply, axis_name=MJX_WORLD_AXIS_NAME)(state, delta_xy_world)
+
     def physical_data(self, state: State):
         """Fresh endpoint kinematics on copied data, without changing policy state."""
         return jax.vmap(
-            lambda data: mjx.forward(self.env.mjx_model, data), axis_name=MJX_WORLD_AXIS_NAME
-        )(owned_data(state.data))
+            lambda world: mjx.forward(self.env.model_for_state(world), owned_data(world.data)),
+            axis_name=MJX_WORLD_AXIS_NAME
+        )(state)
 
 
 

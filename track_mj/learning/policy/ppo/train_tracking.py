@@ -26,6 +26,7 @@ from brax import base
 from brax import envs
 from track_mj.learning.policy.ppo import acting_tracking
 from track_mj.learning.policy.ppo import metrics_aggregator as metric_logger
+from track_mj.learning.policy.jax_sharding import replicate_for_pmap
 from brax.training import gradients
 from brax.training import pmap
 from brax.training import types
@@ -548,7 +549,7 @@ def train(
             {},
         )
 
-    training_state = jax.device_put_replicated(training_state, jax.local_devices()[:local_devices_to_use])
+    training_state = replicate_for_pmap(training_state, jax.local_devices()[:local_devices_to_use])
 
     # Run initial eval
     training_metrics = {}

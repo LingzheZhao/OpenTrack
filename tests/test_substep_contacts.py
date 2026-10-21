@@ -19,11 +19,12 @@ from track_mj.envs.g1_tracking_dagger.train import g1_env_tracking_general as na
 
 CONTACT = SimpleNamespace(
     efc_address=np.array([0, 3, -1, 6]),
+    dist=jp.array([-.01, -.02, -.03, -.04]), includemargin=jp.zeros(4),
     geom=jp.array([[0, 1], [2, 1], [1, 2], [-1, -1]]),
     frame=jp.array([[[0., 0., 1.], [1., 0., 0.], [0., 1., 0.]],
                     np.eye(3), np.eye(3), np.eye(3)]),
 )
-MODEL = SimpleNamespace(impl=mjx.Impl.JAX, nbody=3, geom_bodyid=np.array([0, 1, 2]),
+MODEL = SimpleNamespace(impl=mjx.Impl.JAX, nbody=3, geom_bodyid=np.array([0, 1, 2]), geom_type=np.array([0, 2, 2]),
                         opt=SimpleNamespace(integrator=mjx.IntegratorType.EULER))
 
 
@@ -85,18 +86,41 @@ class SubstepContactTests(unittest.TestCase):
                                       [[-2, 0, -10], [7, -1, 13], [-5, 1, -3]])
         np.testing.assert_array_equal(sample.normal_force_world_by_body_n,
                                       [[0, 0, -10], [5, 0, 10], [-5, 0, 0]])
+        np.testing.assert_array_equal(sample.ground_normal_force_world_by_body_n,
+                                      [[0, 0, -10], [0, 0, 10], [0, 0, 0]])
+        np.testing.assert_array_equal(sample.ground_contact_found_by_body, [True, True, False])
         np.testing.assert_array_equal(sample.normal_n, [10, 5, 0, 0])
         np.testing.assert_array_equal(sample.constraint_present, [True, True, False, False])
+        np.testing.assert_array_equal(sample.contact_found, [True, True, False, False])
+        np.testing.assert_array_equal(sample.distance_m, CONTACT.dist)
+        np.testing.assert_array_equal(sample.inclusion_margin_m, CONTACT.includemargin)
         np.testing.assert_array_equal(sample.total_force_world_n[2:], jp.zeros((2, 3)))
         np.testing.assert_array_equal(sample.total_force_world_by_body_n.sum(axis=0), [0, 0, 0])
         for value in sample:
             self.assertTrue(np.isfinite(value).all())
+        # Native addresses/pair IDs remain allocated while geometry separates.
+        # A zero-gap touch is geometric contact, but the native zero-margin
+        # constraint is inactive at equality. Force is not the occurrence test.
+        with patch.object(support, 'contact_force', return_value=jp.zeros(6)), \
+             patch.object(CONTACT, 'dist', jp.array([.1, 0., -.1, -.1])):
+            touch = native._solved_contact_sample(MODEL, initial_data(), jp.array(0.))
+        np.testing.assert_array_equal(touch.constraint_present, [False, False, False, False])
+        np.testing.assert_array_equal(touch.contact_found, [False, True, False, False])
+        with patch.object(support, 'contact_force', return_value=jp.zeros(6)), \
+             patch.object(CONTACT, 'dist', jp.array([.01, -.01, -.1, -.1])), \
+             patch.object(CONTACT, 'includemargin', jp.array([.02, 0., 0., 0.])):
+            margin = native._solved_contact_sample(MODEL, initial_data(), jp.array(0.))
+        np.testing.assert_array_equal(margin.constraint_present, [True, True, False, False])
+        np.testing.assert_array_equal(margin.contact_found, [False, True, False, False])
+        np.testing.assert_array_equal(margin.ground_contact_found_by_body, [False, False, False])
+        np.testing.assert_array_equal(margin.normal_n, jp.zeros(4))
 
     def test_no_contact_capacity_returns_zero_body_forces(self):
         empty = SimpleNamespace(efc_address=np.zeros(0, dtype=int), geom=jp.zeros((0, 2), dtype=int),
-                                frame=jp.zeros((0, 3, 3)))
+                                frame=jp.zeros((0, 3, 3)), dist=jp.zeros(0), includemargin=jp.zeros(0))
         with patch.object(CONTACT, 'efc_address', empty.efc_address), \
-             patch.object(CONTACT, 'geom', empty.geom), patch.object(CONTACT, 'frame', empty.frame):
+             patch.object(CONTACT, 'geom', empty.geom), patch.object(CONTACT, 'frame', empty.frame), \
+             patch.object(CONTACT, 'dist', empty.dist), patch.object(CONTACT, 'includemargin', empty.includemargin):
             sample = native._solved_contact_sample(MODEL, initial_data(), jp.array(0.))
         self.assertEqual(sample.total_force_world_n.shape, (0, 3))
         np.testing.assert_array_equal(sample.total_force_world_by_body_n, jp.zeros((3, 3)))
@@ -129,11 +153,13 @@ class SubstepContactTests(unittest.TestCase):
     def test_environment_keeps_terminal_state_and_input_containers(self):
         real = native.G1TrackingGeneralEnv
         Env = type('FakePhysicsEnv', (), {name: getattr(real, name) for name in
-                   ('step', 'step_no_autoreset', 'step_with_contacts', '_step', '_get_motor_targets')})
+                   ('step', 'step_no_autoreset', 'step_with_contacts', '_step', '_get_motor_targets', 'model_for_state', 'model_for_centers', '_advance_reference')})
         env = Env()
         env._config = SimpleNamespace(student_use_residual_action=True, action_scale=1., history_len=0,
                                      episode_length=100, reward_config=SimpleNamespace(scales={'x': 1.}))
         env.mjx_model = MODEL
+        env.obstacle_geom_ids, env._obstacle_centers, env.reference_mode = (), jp.zeros((0,3)), "tracking"
+        env._warp_obstacle_mode = None
         env.action_joint_ids = jp.arange(29)
         env._default_qpos = jp.zeros(29)
         env._kps = env._kds = env.torque_limit = jp.ones(29)
