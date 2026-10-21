@@ -626,6 +626,7 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         rng, _noise_rng = jax.random.split(rng, 2)
 
         carry = self.th.reset_state_with_trajectory(trajectory_data, TrajCarry(rng, self.th.init_state()))
+        initial_traj_info = carry
         init_traj_data = self.th.get_current_traj_data_with_trajectory(trajectory_data, carry)  # get traj state
 
         # add noise to RSI-ed actor root pos & rot
@@ -682,6 +683,7 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
             # reference trajectory info
             "traj_no": traj_no,
             "traj_info": carry,
+            "initial_traj_info": initial_traj_info,
         }
 
         if self.obstacle_geom_ids:
@@ -693,17 +695,81 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         for k in self._config.reward_config.scales.keys():
             metrics[f"reward/{k}"] = jp.zeros(())
 
-        obs, history = self._get_obs(data, traj_data, info)
+        info["initial_obs_rng"] = info["rng"]
+        obs = self._reset_observation(data, traj_data, init_traj_data, info)
+        reward, done = jp.zeros(2)
+        return mjx_env.State(data, obs, reward, done, metrics, info)
+
+    def _reset_observation(self, data, current_traj_data, initial_traj_data, info):
+        """Build first observation and reset-side history from native references."""
+        obs, history = self._get_obs(data, current_traj_data, info)
         if self._config.history_len > 0:
-            _, init_history = self._get_obs(data, init_traj_data, info)
+            _, init_history = self._get_obs(data, initial_traj_data, info)
             info["previous_obs"] = jp.stack([init_history] * self._config.history_len, axis=0)
 
             obs["state"] = jp.concatenate([obs["state"], info["previous_obs"].flatten()], axis=0)
             obs["privileged_state"] = jp.concatenate([obs["privileged_state"], info["previous_obs"].flatten()], axis=0)
             info["previous_obs"] = jp.concatenate([info["previous_obs"][1:], history[None, :]], axis=0)
 
-        reward, done = jp.zeros(2)
-        return mjx_env.State(data, obs, reward, done, metrics, info)
+        return obs
+
+    def initialize_physical_start(self, state: mjx_env.State, trajectory_data: TrajectoryData,
+                                  root_link_pose_w, root_link_velocity_w,
+                                  joint_position, joint_velocity) -> mjx_env.State:
+        """Rewrite an already-reset PRE state without advancing time or reference.
+
+        The pose is pelvis LINK world xyz + WXYZ quaternion. Velocity is world
+        LINK linear xyz + world angular xyz. Joint arrays follow native G1
+        qpos/qvel order. MuJoCo freejoint angular velocity is body-frame;
+        kinematic forward also resolves a possible LINK-to-freejoint offset.
+        """
+        if (root_link_pose_w.shape != (7,) or root_link_velocity_w.shape != (6,)
+                or joint_position.shape != (self.num_joints,)
+                or joint_velocity.shape != (self.num_joints,)):
+            raise ValueError("physical start requires root pose[7], world LINK velocity[6], and native joint pos/vel")
+        model = self.mj_model
+        pelvis = int(model.body("pelvis").id)
+        joint = int(model.body_jntadr[pelvis])
+        if (int(model.body_parentid[pelvis]) != 0 or int(model.body_jntnum[pelvis]) != 1
+                or int(model.jnt_type[joint]) != int(mujoco.mjtJoint.mjJNT_FREE)
+                or int(model.jnt_qposadr[joint]) != 0 or int(model.jnt_dofadr[joint]) != 0):
+            raise ValueError("physical start requires a world-parent pelvis freejoint at qpos/qvel root")
+        if trajectory_data is None:
+            trajectory_data = self.th.traj.data
+        state = copy_state_containers(state)
+        pose = jp.asarray(root_link_pose_w)
+        velocity = jp.asarray(root_link_velocity_w)
+        joint_position = jp.asarray(joint_position)
+        joint_velocity = jp.asarray(joint_velocity)
+        angular_body = math.rotate(velocity[3:6], math.quat_inv(pose[3:7]))
+        provisional_qpos = jp.concatenate((pose, joint_position))
+        provisional_qvel = jp.concatenate((velocity[:3], angular_body, joint_velocity))
+        native_model = self.model_for_state(state)
+        provisional = mjx.forward(native_model, state.data.replace(
+            qpos=provisional_qpos, qvel=provisional_qvel, ctrl=joint_position))
+        offset_w = provisional.xpos[pelvis] - provisional_qpos[:3]
+        qpos = provisional_qpos.at[:3].add(-offset_w)
+        qvel = provisional_qvel.at[:3].add(-jp.cross(velocity[3:6], offset_w))
+        data = mjx.forward(native_model, state.data.replace(
+            qpos=qpos, qvel=qvel, ctrl=joint_position))
+        info = state.info
+        info["last_motor_targets"] = data.qpos[7:][self.action_joint_ids]
+        info["last_action"] = jp.zeros_like(info["last_action"])
+        info["last_root_pos"] = data.qpos[:3]
+        info["last_root_ori"] = data.qpos[3:7]
+        info["last_dof_pos"] = data.qpos[7:]
+        info["last_rigid_body_pos"] = data.xpos
+        info["last_rigid_body_ori"] = data.xquat
+        info["last_joint_vel"] = data.qvel[6:]
+        if self._evaluation_physical_stop is not None:
+            info["evaluation_physical_stop"] = self._physical_stop_flags(data)
+        current_ref = self.th.get_current_traj_data_with_trajectory(
+            trajectory_data, info["traj_info"])
+        initial_ref = self.th.get_current_traj_data_with_trajectory(
+            trajectory_data, info["initial_traj_info"])
+        info["rng"] = info["initial_obs_rng"]
+        obs = self._reset_observation(data, current_ref, initial_ref, info)
+        return state.replace(data=data, obs=obs, info=info)
 
 
     def _get_motor_targets(self, state: mjx_env.State, action: jax.Array, use_residual_action: bool, trajectory_data: TrajectoryData = None) -> jax.Array:

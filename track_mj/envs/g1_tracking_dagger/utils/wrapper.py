@@ -74,6 +74,20 @@ class VmapWrapper(Wrapper):
         state = jax.vmap(self.env.reset, in_axes=(0, None), axis_name=MJX_WORLD_AXIS_NAME)(rng, trajectory_data)
         return _annotate_worldid(state)
 
+    def initialize_physical_start(self, state: State, trajectory_data,
+                                  root_link_pose_w, root_link_velocity_w,
+                                  joint_position, joint_velocity) -> State:
+        """Apply one explicit physical PRE state per already-reset world."""
+        worlds = state.done.shape[0]
+        expected = ((worlds, 7), (worlds, 6),
+                    (worlds, self.env.num_joints), (worlds, self.env.num_joints))
+        values = (root_link_pose_w, root_link_velocity_w, joint_position, joint_velocity)
+        if any(value.shape != shape for value, shape in zip(values, expected)):
+            raise ValueError("physical start requires [worlds,7/6/native joints/native joints] arrays")
+        return jax.vmap(self.env.initialize_physical_start,
+                        in_axes=(0, None, 0, 0, 0, 0),
+                        axis_name=MJX_WORLD_AXIS_NAME)(state, trajectory_data, *values)
+
     def step(self, state: State, action: jax.Array, trajectory_data) -> State:
         state = jax.vmap(self.env.step, in_axes=(0, 0, None), axis_name=MJX_WORLD_AXIS_NAME)(
             state, action, trajectory_data
