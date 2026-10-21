@@ -13,8 +13,8 @@ from mujoco import mjx
 import numpy as np
 
 from track_mj.utils.warp_obstacles import (
-    add_mocap_pillar, add_pillar_pairs_and_sensors, decode_pair_sensor,
-    pair_sensor_layout, require_complete_pillar_coverage,
+    add_mocap_pillar, add_mocap_sphere, add_pillar_pairs_and_sensors, decode_pair_sensor,
+    pair_sensor_layout, require_complete_obstacle_coverage, require_complete_pillar_coverage,
     select_warp_reset_data_and_forward, warp_measurement_invalid,
 )
 
@@ -31,6 +31,25 @@ def model_with_sensor(slots=4):
 
 
 class WarpPillarCandidateTests(unittest.TestCase):
+    def test_exact_mocap_sphere_uses_the_same_complete_pair_contract(self):
+        spec = mujoco.MjSpec.from_string('''<mujoco model="sphere probe"><worldbody>
+            <body name="robot" pos="0 0 .8"><freejoint/>
+              <geom name="foot" type="box" size=".1 .1 .1"/>
+            </body></worldbody></mujoco>''')
+        add_mocap_sphere(spec, name="ball", center_xyz=(.2, 0, .8), radius_m=.15)
+        names = add_pillar_pairs_and_sensors(spec, robot_geom_names=("foot",),
+                                              pillar_geom_names=("ball",))
+        model = spec.compile()
+        self.assertEqual(int(model.geom_type[model.geom("ball").id]),
+                         int(mujoco.mjtGeom.mjGEOM_SPHERE))
+        self.assertEqual(len(require_complete_obstacle_coverage(
+            model, obstacle_names=("ball",), sensor_names=names,
+            root_body_id=int(model.body("robot").id))), 1)
+        with self.assertRaisesRegex(ValueError, "true cylinders"):
+            require_complete_pillar_coverage(model, obstacle_names=("ball",),
+                sensor_names=names, root_body_id=int(model.body("robot").id))
+        self.assertEqual(mjx.put_model(model, impl="warp").impl, mjx.Impl.WARP)
+
     def test_full_g1_model_admits_two_exact_cylinders_and_all_pairs(self):
         from track_mj.envs.g1_tracking_dagger import g1_tracking_constants as constants
         from track_mj.envs.g1_tracking_dagger.train.g1_env_tracking_general import (

@@ -14,7 +14,7 @@ from mujoco.mjx._src import math
 from mujoco_playground._src import mjx_env
 from track_mj.utils.mjx_backend import geoms_colliding, mjx_impl
 from track_mj.utils.warp_obstacles import (
-    PillarSubstep, require_complete_pillar_coverage, sample_warp_pillar_contacts,
+    PillarSubstep, require_complete_obstacle_coverage, sample_warp_pillar_contacts,
 )
 from track_mj.envs.evaluation import copy_state_containers
 
@@ -390,7 +390,7 @@ class G1TrackingGeneralEnv(g1_base.G1Env):
         self._obstacle_mocap_ids = ()
         self._mocap_default_pos = None
         if warp_candidate:
-            self._warp_pair_sensors = require_complete_pillar_coverage(
+            self._warp_pair_sensors = require_complete_obstacle_coverage(
                 self.mj_model, obstacle_names=obstacle_geom_names,
                 sensor_names=warp_obstacle_sensor_names,
                 root_body_id=int(self.mj_model.body("pelvis").id))
