@@ -50,6 +50,8 @@ class PillarSubstep(NamedTuple):
     interval_start_s: object
     interval_end_s: object
     pair_found_count: object
+    pair_distance_available: object
+    pair_min_signed_distance_m: object
     pair_geometric_contact: object
     pair_max_normal_force_n: object
     pair_max_total_force_n: object
@@ -185,6 +187,9 @@ def decode_pair_sensor(sensordata, sensor: PairSensor):
                | (found > sensor.slots))
     return {
         "found_count": found,
+        "distance_available": found > 0,
+        "min_signed_distance_m": jp.where(found > 0,
+            jp.min(jp.where(occupied, distance, jp.inf)), 0),
         "geometric_contact": jp.any(occupied & (distance <= 0)),
         "max_normal_force_n": jp.max(jp.where(occupied, jp.maximum(force[:, 0], 0), 0)),
         "max_total_force_n": jp.max(jp.where(occupied, jp.linalg.norm(force, axis=-1), 0)),
@@ -193,10 +198,12 @@ def decode_pair_sensor(sensordata, sensor: PairSensor):
 
 
 def warp_measurement_invalid(data, pair_readings) -> object:
-    """Fail closed on a native Warp buffer overflow or sensor slot truncation.
+    """Fail closed on any native diagnostic bit or sensor slot truncation.
 
     The source's recorder must check the returned JAX boolean after every
     actual physics substep, before publishing a force or no-contact claim.
+    Native bits include solver-iteration limits as well as capacity overflows;
+    the raw bitmask must be retained instead of labeling every bit capacity.
     """
     if data.impl != mjx.Impl.WARP or not hasattr(data._impl, "overflow"):
         raise ValueError("the declared Warp overflow channel is unavailable")
@@ -213,6 +220,8 @@ def sample_warp_pillar_contacts(data, interval_start, layout: tuple[PairSensor, 
         interval_start_s=interval_start,
         interval_end_s=data.time,
         pair_found_count=jp.stack([item["found_count"] for item in readings]),
+        pair_distance_available=jp.stack([item["distance_available"] for item in readings]),
+        pair_min_signed_distance_m=jp.stack([item["min_signed_distance_m"] for item in readings]),
         pair_geometric_contact=jp.stack([item["geometric_contact"] for item in readings]),
         pair_max_normal_force_n=jp.stack([item["max_normal_force_n"] for item in readings]),
         pair_max_total_force_n=jp.stack([item["max_total_force_n"] for item in readings]),

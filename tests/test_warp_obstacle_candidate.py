@@ -140,6 +140,8 @@ class WarpPillarCandidateTests(unittest.TestCase):
         mujoco.mj_forward(model, data)
         contact = decode_pair_sensor(data.sensordata, layout[0])
         self.assertEqual(float(contact["found_count"]), 2)
+        self.assertTrue(bool(contact["distance_available"]))
+        self.assertLess(float(contact["min_signed_distance_m"]), 0)
         self.assertTrue(bool(contact["geometric_contact"]))
         self.assertGreater(float(contact["max_normal_force_n"]), 0)
         self.assertFalse(bool(contact["invalid"]))
@@ -147,6 +149,8 @@ class WarpPillarCandidateTests(unittest.TestCase):
         mujoco.mj_forward(model, data)
         far = decode_pair_sensor(data.sensordata, layout[0])
         self.assertEqual(float(far["found_count"]), 0)
+        self.assertFalse(bool(far["distance_available"]))
+        self.assertEqual(float(far["min_signed_distance_m"]), 0)
         self.assertFalse(bool(far["geometric_contact"]))
 
     def test_full_found_count_exposes_sensor_slot_truncation(self):
