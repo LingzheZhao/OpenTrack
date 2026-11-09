@@ -120,8 +120,7 @@ def put_model(
         raise ValueError(f"Unsupported OPENTRACK_MJX_IMPL={impl!r}; expected 'jax' or 'warp'.")
     if not _supports_mjx_impl_arg(mjx.put_model):
         raise RuntimeError(
-            "OPENTRACK_MJX_IMPL=warp requires mujoco-mjx>=3.9.0. "
-            "Install with `uv sync` after updating dependencies."
+            "OPENTRACK_MJX_IMPL=warp requires mujoco-mjx[warp] 4.0 (see pyproject.toml)."
         )
     return mjx.put_model(mj_model, impl="warp", graph_mode=_warp_graph_mode(config))
 
@@ -160,8 +159,7 @@ def make_data(
         raise ValueError(f"Unsupported OPENTRACK_MJX_IMPL={impl!r}; expected 'jax' or 'warp'.")
     if not _supports_mjx_impl_arg(mjx.make_data):
         raise RuntimeError(
-            "OPENTRACK_MJX_IMPL=warp requires mujoco-mjx>=3.9.0. "
-            "Install with `uv sync` after updating dependencies."
+            "OPENTRACK_MJX_IMPL=warp requires mujoco-mjx[warp] 4.0 (see pyproject.toml)."
         )
     return mjx.make_data(mj_model, impl="warp", **_warp_buffer_sizes(config))
 
