@@ -42,10 +42,14 @@ This repository is the official implementation of OpenTrack, an open-source huma
     git clone git@github.com:GalaxyGeneralRobotics/OpenTrack.git
     ```
 
-2. Create a virtual environment and install dependencies:
+2. Create a Python 3.12 virtual environment and install dependencies:
     ```shell
-    uv sync -i https://pypi.org/simple 
+    uv sync -i https://pypi.org/simple --extra cuda --extra training --extra export --extra display
     ```
+    The core set (MuJoCo and MJX 4.0, JAX 0.12, Brax, Flax, Playground 0.2) trains and evaluates the
+    JAX tracker. The optional sets add the JAX CUDA 13 plugin (`cuda`), Torch 2.14 for DAgger and the
+    adapter (`training`), TensorFlow CPU and tf2onnx for ONNX export (`export`), rendering and interactive
+    tools (`display`), and tools no module imports (`tools`).
 
 3. Create a `.env` file in the project directory with the following content:
     ```bash
