@@ -184,6 +184,39 @@ class EvaluationBoundaryTests(unittest.TestCase):
                 np.testing.assert_array_equal(reset.info['truncation'], [0., 0.])
                 self.assertFalse(np.array_equal(reset.info['rng'][1], terminal.info['rng'][1]))
 
+    def test_warp_reset_of_done_worlds_selects_data_per_world(self):
+        """Outside the mocap scene, Warp Data goes through the per-world selection; MJX-JAX does not."""
+        module = WRAPPERS['g1_tracking_dagger']
+        env, _, _ = fake_native('g1_tracking_dagger', False, False)
+        env._get_termination = lambda data, reference, info: data.qpos[7] > .5
+        vector = module.VmapWrapper(env)
+        pre = vector.reset(jax.random.split(jax.random.PRNGKey(5), 2), object())
+        terminal = vector.step_no_autoreset(pre, jp.zeros((2, 29)).at[1, 0].set(1), object())
+        np.testing.assert_array_equal(terminal.done, [False, True])
+        np.testing.assert_array_equal(terminal.data.qpos[1, 7], 2)
+        calls = []
+
+        def select_per_world(model, current, reset, done):
+            calls.append(np.asarray(done))
+            return jax.tree_util.tree_map(
+                lambda r, v: jp.where(done.reshape(done.shape + (1,) * (v.ndim - 1)), r, v), reset, current)
+
+        with patch.object(module, '_is_warp_env', return_value=True), \
+                patch.object(module, 'select_warp_reset_data_and_forward', side_effect=select_per_world):
+            reset = vector.reset_done(terminal, object())
+        self.assertEqual(len(calls), 1)
+        np.testing.assert_array_equal(calls[0], [False, True])
+        for original, continued in zip(jax.tree_util.tree_leaves(terminal), jax.tree_util.tree_leaves(reset)):
+            np.testing.assert_array_equal(original[0], continued[0])
+        np.testing.assert_array_equal(reset.data.qpos[1, 7:], jp.zeros(29))
+        self.assertFalse(bool(reset.done[1]))
+        np.testing.assert_array_equal(reset.info['truncation'], [0., 0.])
+        np.testing.assert_array_equal(reset.info['worldid'], [0, 1])
+        self.assertFalse(np.array_equal(reset.info['rng'][1], terminal.info['rng'][1]))
+        with patch.object(module, 'select_warp_reset_data_and_forward', side_effect=AssertionError):
+            jax_reset = vector.reset_done(terminal, object())
+        assert_tree_equal(self, jax_reset, reset)
+
     def test_physical_measurement_owns_its_array_storage(self):
         source = {"qpos": jp.ones((2, 3))}
         owned = evaluation.owned_data(source)

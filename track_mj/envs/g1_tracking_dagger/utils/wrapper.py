@@ -135,14 +135,30 @@ class VmapWrapper(Wrapper):
         )
 
     def reset_done(self, state: State, trajectory_data) -> State:
-        """Reset actual done worlds; retain all unselected state and key leaves."""
-        if getattr(self.env, "_warp_obstacle_mode", None) == "mocap_sensors":
+        """Reset actual done worlds; retain all unselected state and key leaves.
+
+        On MuJoCo Warp, with or without the mocap obstacle scene, ``Data`` is
+        selected per world with ``Data.where`` and forwarded
+        (``select_warp_reset_data_and_forward``), and the other state leaves
+        are selected by the done mask. MJX passes the batch-wide fields of Warp
+        ``Data`` (``mujoco.mjx.warp.types.DATA_NON_VMAP``: the ``contact__*``
+        buffers and the capacity scalars) through ``jax.vmap`` unbatched, so a
+        leaf-wise ``jp.where`` on a per-world flag would turn them into batched
+        values that leave the transformation (``UnexpectedTracerError``).
+        ``Data.where`` keeps those fields from the state before the reset; the
+        next physics step recomputes the contacts. MJX-JAX keeps the leaf-wise
+        selection.
+        """
+        mocap = getattr(self.env, "_warp_obstacle_mode", None) == "mocap_sensors"
+        if mocap or _is_warp_env(self.env):
             done = state.done.astype(bool)
 
             def fresh_world(world):
                 key, _ = jax.random.split(world.info["rng"])
-                reset = self.env.reset(key, trajectory_data,
-                    obstacle_centers=world.info["physical_obstacle_centers"])
+                # The mocap scene keeps every world's obstacle centers; other scenes may have none.
+                centers = (world.info["physical_obstacle_centers"] if mocap
+                           else world.info.get("physical_obstacle_centers"))
+                reset = self.env.reset(key, trajectory_data, obstacle_centers=centers)
                 info = {**world.info, **reset.info}
                 if "truncation" in info:
                     info["truncation"] = jp.zeros_like(info["truncation"])

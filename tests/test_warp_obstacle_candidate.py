@@ -169,6 +169,43 @@ class WarpPillarCandidateTests(unittest.TestCase):
         self.assertTrue(bool(warp_measurement_invalid(warp, (safe,))))
 
     @unittest.skipUnless(os.getenv("OT_TEST_WARP_CPU") == "1", "explicit pinned-image CPU Warp proof")
+    def test_vector_reset_of_done_worlds_outside_the_mocap_scene(self):
+        from mujoco_playground._src.mjx_env import State
+        from track_mj.envs.g1_tracking_dagger.utils.wrapper import VmapWrapper
+
+        model, _ = model_with_sensor()
+        warp_model = mjx.put_model(model, impl="warp")
+        template = mjx.make_data(model, impl="warp", naconmax=32, njmax=64)
+
+        class TinyWarpEnv:
+            _warp_obstacle_mode = None
+            _config = SimpleNamespace(mjx=SimpleNamespace(impl="warp"))
+            mjx_model = warp_model
+
+            def reset(self, key, trajectory_data, *, obstacle_centers=None):
+                del trajectory_data, obstacle_centers
+                height = jax.random.uniform(key, minval=1., maxval=2.)
+                data = mjx.forward(warp_model, template.replace(qpos=template.qpos.at[2].set(height)))
+                return State(data=data, obs={"height": height}, reward=jp.array(0.),
+                             done=jp.array(False), metrics={}, info={"rng": key})
+
+        env = VmapWrapper(TinyWarpEnv())
+        state = jax.jit(lambda keys: env.reset(keys, None))(jax.random.split(jax.random.PRNGKey(4), 2))
+        selected = state.replace(done=jp.array([False, True]))
+        # A leaf-wise jp.where over Warp Data would raise UnexpectedTracerError here.
+        after = jax.jit(env.reset_done)(selected, None)
+        np.testing.assert_array_equal(after.data.qpos[0], state.data.qpos[0])
+        np.testing.assert_array_equal(after.data.qvel[0], state.data.qvel[0])
+        self.assertFalse(np.array_equal(after.data.qpos[1], state.data.qpos[1]))
+        np.testing.assert_array_equal(after.obs["height"][0], state.obs["height"][0])
+        np.testing.assert_array_equal(after.obs["height"][1], after.data.qpos[1, 2])
+        np.testing.assert_array_equal(after.done, [False, False])
+        np.testing.assert_array_equal(after.info["worldid"], [0, 1])
+        stepped = jax.jit(jax.vmap(lambda world: mjx.step(warp_model, world)))(after.data)
+        np.testing.assert_allclose(stepped.time, after.data.time + model.opt.timestep, atol=1e-7)
+        self.assertTrue(bool(jp.all(jp.isfinite(stepped.qpos))))
+
+    @unittest.skipUnless(os.getenv("OT_TEST_WARP_CPU") == "1", "explicit pinned-image CPU Warp proof")
     def test_two_world_mocap_and_selective_data_where(self):
         from track_mj.envs.g1_tracking_dagger.train.g1_env_tracking_general import (
             torque_step, torque_step_with_pillar_sensors,
